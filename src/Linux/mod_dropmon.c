@@ -57,7 +57,9 @@ extern "C" {
 #define NET_DM_ATTR_HW_TRAP_COUNT 19             /* u32 */
 #define NET_DM_ATTR_SW_DROPS 20                  /* flag */
 #define NET_DM_ATTR_HW_DROPS 21                  /* flag */
-#define NET_DM_ATTR_MAX NET_DM_ATTR_HW_DROPS
+#define NET_DM_ATTR_FLOW_ACTION_COOKIE 22        /* binary */
+#define NET_DM_ATTR_REASON 23                    /* string */
+#define NET_DM_ATTR_MAX NET_DM_ATTR_REASON
 
 /* net_dm_alert_mode */
 #define NET_DM_ALERT_MODE_SUMMARY 0
@@ -70,10 +72,10 @@ extern "C" {
   
 #endif /* HSP_REPLICATE_DROPMON_DEFS */		      
   
-#define HSP_DROPMON_READNL_RCV_BUF 8192
+#define HSP_DROPMON_READNL_RCV_BUF 16384
 #define HSP_DROPMON_READNL_BATCH 100
 #define HSP_DROPMON_RCVBUF 8000000
-#define HSP_DROPMON_QUEUE 100
+#define HSP_DROPMON_QUEUE 1000 // seems to be default (in kernel net/core/drop_monitor.c)
 
   typedef enum {
     HSP_DROPMON_STATE_INIT=0,
@@ -122,16 +124,20 @@ extern "C" {
     uint32_t last_grp_seq;
     UTHash *dropPoints_sw;
     UTHash *dropPoints_hw;
+    UTHash *dropPoints_rn;
     UTArray *dropPatterns_sw;
     UTArray *dropPatterns_hw;
+    UTArray *dropPatterns_rn;
     UTHash *notifiers;
     uint32_t feedControlErrors;
-    int quota;   // nofification rate-limit
+    int quota;   // notification rate-limit
     uint32_t noQuota; // number of rate-limit drops
     uint32_t ignoredDrops_hw;
     uint32_t ignoredDrops_sw;
+    uint32_t ignoredDrops_rn;
     uint32_t totalDrops_thisTick; // for threshold
     bool dropmon_disabled;
+    EVEvent *evt_intf_es;
   } HSP_mod_DROPMON;
 
 
@@ -143,7 +149,7 @@ extern "C" {
   static void setState(EVMod *mod, EnumDropmonState newState) {
     HSP_mod_DROPMON *mdata = (HSP_mod_DROPMON *)mod->data;
     if(newState != mdata->state) {
-      myDebug(1, "dropmon state %s -> %s",
+      EVDebug(mod, 1, "state %s -> %s",
 	      HSPDropmonStateNames[mdata->state],
 	      HSPDropmonStateNames[newState]);
       mdata->state = newState;
@@ -167,16 +173,33 @@ extern "C" {
     HSP_mod_DROPMON *mdata = (HSP_mod_DROPMON *)mod->data;
     if(dropPoint->pattern)
       UTArrayAdd(mdata->dropPatterns_sw, dropPoint);
-    else
+    else {
+      if(UTHashGet(mdata->dropPoints_sw, dropPoint))
+	EVDebug(mod, 0, "WARNING: duplicate software-dropPoint key: %s", dropPoint->dropPoint);
       UTHashAdd(mdata->dropPoints_sw, dropPoint);
+    }
   }
 
   static void addDropPoint_hw(EVMod *mod, HSPDropPoint *dropPoint) {
     HSP_mod_DROPMON *mdata = (HSP_mod_DROPMON *)mod->data;
     if(dropPoint->pattern)
       UTArrayAdd(mdata->dropPatterns_hw, dropPoint);
-    else
+    else {
+      if(UTHashGet(mdata->dropPoints_hw, dropPoint))
+	EVDebug(mod, 0, "WARNING: duplicate hardware-dropPoint key: %s", dropPoint->dropPoint);
       UTHashAdd(mdata->dropPoints_hw, dropPoint);
+    }
+  }
+
+  static void addDropPoint_rn(EVMod *mod, HSPDropPoint *dropPoint) {
+    HSP_mod_DROPMON *mdata = (HSP_mod_DROPMON *)mod->data;
+    if(dropPoint->pattern)
+      UTArrayAdd(mdata->dropPatterns_rn, dropPoint);
+    else {
+      if(UTHashGet(mdata->dropPoints_rn, dropPoint))
+        EVDebug(mod, 0, "WARNING: duplicate reason-dropPoint key: %s", dropPoint->dropPoint);
+      UTHashAdd(mdata->dropPoints_rn, dropPoint);
+    }
   }
 
   /*_________________---------------------------__________________
@@ -189,7 +212,8 @@ extern "C" {
 
     // we may have been configured to ignore sw drops
     HSP *sp = (HSP *)EVROOTDATA(mod);
-    if(!sp->dropmon.sw) {
+    if(!sp->dropmon.sw
+       && !sp->dropmon.sw_passive) {
       mdata->ignoredDrops_sw++;
       return NULL;
     }
@@ -204,7 +228,7 @@ extern "C" {
     UTARRAY_WALK(mdata->dropPatterns_sw, dp) {
       if(fnmatch(dp->dropPoint, sw_symbol, FNM_CASEFOLD) == 0) {
 	// yes - add the direct lookup to the hash table for next time and return it
-	myDebug(1, "dropPoint pattern %s matched %s", dp->dropPoint, sw_symbol);
+	EVDebug(mod, 2, "dropPoint pattern %s matched %s", dp->dropPoint, sw_symbol);
 	dp = newDropPoint(sw_symbol, NO, dp->reason);
 	addDropPoint_sw(mod, dp);
 	return dp;
@@ -219,7 +243,8 @@ extern "C" {
 
     // we may have been configured to ignore hw drops
     HSP *sp = (HSP *)EVROOTDATA(mod);
-    if(!sp->dropmon.hw) {
+    if(!sp->dropmon.hw
+       && !sp->dropmon.hw_passive) {
       mdata->ignoredDrops_hw++;
       return NULL;
     }
@@ -242,8 +267,42 @@ extern "C" {
     UTARRAY_WALK(mdata->dropPatterns_hw, dp) {
       if(fnmatch(dp->dropPoint, dropPointStr, FNM_CASEFOLD) == 0) {
 	// yes - add the direct lookup to the hash table for next time
+	EVDebug(mod, 2, "dropPoint pattern %s matched grp=%s str=%s",
+		dp->dropPoint,
+		group ?: "<not supplied>",
+		dropPointStr);
 	dp = newDropPoint(dropPointStr, NO, dp->reason);
 	addDropPoint_hw(mod, dp);
+	return dp;
+      }
+    }
+
+    return NULL;
+  }
+
+  static HSPDropPoint *getDropPoint_rn(EVMod *mod, char *dropReason) {
+    HSP_mod_DROPMON *mdata = (HSP_mod_DROPMON *)mod->data;
+
+    // we may have been configured to ignore rn drops
+    HSP *sp = (HSP *)EVROOTDATA(mod);
+    if(!sp->dropmon.rn) {
+      mdata->ignoredDrops_rn++;
+      return NULL;
+    }
+
+    // direct lookup
+    HSPDropPoint search = { .dropPoint = dropReason };
+    HSPDropPoint *dp = UTHashGet(mdata->dropPoints_rn, &search);
+    if(dp)
+      return dp;
+
+    // see if we can find it via a pattern
+    UTARRAY_WALK(mdata->dropPatterns_rn, dp) {
+      if(fnmatch(dp->dropPoint, dropReason, FNM_CASEFOLD) == 0) {
+	// yes - add the direct lookup to the hash table for next time and return it
+	EVDebug(mod, 2, "dropPoint pattern %s matched %s", dp->dropPoint, dropReason);
+	dp = newDropPoint(dropReason, NO, dp->reason);
+	addDropPoint_rn(mod, dp);
 	return dp;
       }
     }
@@ -268,7 +327,7 @@ extern "C" {
       if(my_strequal(reasonName, sflow_codes[ii].name))
 	return sflow_codes[ii].code;
     }
-    return -1;
+    return -1; // not found
   }
 
   /*_________________---------------------------__________________
@@ -289,12 +348,15 @@ extern "C" {
   static HSPDropPointLoader LoadDropPoints_hw[] = {
 #include "dropPoints_hw.h"
   };
+  static HSPDropPointLoader LoadDropPoints_rn[] = {
+#include "dropPoints_rn.h"
+  };
 #undef HSP_DROPPOINT
 
 #define HSP_ARRAY_SIZE(x) (sizeof(x) / sizeof(x[0]))
 
-  static HSPDropPoint *buildDropPoint(HSPDropPointLoader *loader) {
-    myDebug(1, "loading dropPoint %s %s: reason=\"%s\"",
+  static HSPDropPoint *buildDropPoint(EVMod *mod, HSPDropPointLoader *loader) {
+    EVDebug(mod, 1, "loading dropPoint %s %s: reason=\"%s\"",
 	    loader->op,
 	    loader->dp,
 	    loader->reason);
@@ -306,7 +368,7 @@ extern "C" {
        && my_strlen(loader->reason) > 0) {
       reasonCode = getReasonCode(loader->reason);
       if(reasonCode < 0) {
-	myDebug(1, "skipping dropPoint: failed reason code lookup \"%s\"", loader->reason);
+	EVDebug(mod, 1, "skipping dropPoint: failed reason code lookup \"%s\"", loader->reason);
 	return NULL;
       }
     }
@@ -315,7 +377,7 @@ extern "C" {
     bool eq = my_strequal(loader->op, "==");
     bool isPattern = my_strequal(loader->op, "*=");
     if(!eq && !isPattern) {
-      myDebug(1, "skipping dropPoint: bad operator \"%s\"", loader->op);
+      EVDebug(mod, 1, "skipping dropPoint: bad operator \"%s\"", loader->op);
       return NULL;
     }
     // All OK
@@ -325,19 +387,38 @@ extern "C" {
   static void loadDropPoints(EVMod *mod) {
     HSP *sp = (HSP *)EVROOTDATA(mod);
 
-    if(sp->dropmon.sw) {
+    if(sp->dropmon.sw
+       || sp->dropmon.sw_passive) {
       for(int ii = 0; ii < HSP_ARRAY_SIZE(LoadDropPoints_sw); ii++) {
-	HSPDropPoint *dp = buildDropPoint(&LoadDropPoints_sw[ii]);
+	HSPDropPoint *dp = buildDropPoint(mod, &LoadDropPoints_sw[ii]);
 	if(dp)
 	  addDropPoint_sw(mod, dp);
       }
     }
 
-    if(sp->dropmon.hw) {
+    if(sp->dropmon.hw
+       || sp->dropmon.hw_passive) {
       for(int ii = 0; ii < HSP_ARRAY_SIZE(LoadDropPoints_hw); ii++) {
-	HSPDropPoint *dp = buildDropPoint(&LoadDropPoints_hw[ii]);
+	HSPDropPoint *dp = buildDropPoint(mod, &LoadDropPoints_hw[ii]);
 	if(dp)
 	  addDropPoint_hw(mod, dp);
+      }
+      if(sp->dropmon.hw_unknown) {
+	// Option to match everything that falls through the classifier. This
+	// is the same as including "HSP_DROPPOINT(*=,*,unknown)" in dropPoints_hw.h
+	// except that we can turn it on/off in the config.
+	HSPDropPointLoader dplAll = { "*=", "*", "unknown" };
+	HSPDropPoint *dp = buildDropPoint(mod, &dplAll);
+	if(dp)
+	  addDropPoint_hw(mod, dp);
+      }
+    }
+
+    if(sp->dropmon.rn) {
+      for(int ii = 0; ii < HSP_ARRAY_SIZE(LoadDropPoints_rn); ii++) {
+	HSPDropPoint *dp = buildDropPoint(mod, &LoadDropPoints_rn[ii]);
+	if(dp)
+	  addDropPoint_rn(mod, dp);
       }
     }
   }
@@ -393,9 +474,11 @@ Or we could call with a vararg list of strutures containing nlattr type,len,payl
 That would allow everything to stay on the stack as it does here, which has nice properties.
 */
 
-  static int start_DROPMON(EVMod *mod, bool startIt)
+  static int start_DROPMON(EVMod *mod, bool startIt, bool sw, bool hw)
   {
     HSP_mod_DROPMON *mdata = (HSP_mod_DROPMON *)mod->data;
+
+    // Always transition state even on no-op
     setState(mod,
 	     startIt
 	     ? HSP_DROPMON_STATE_START
@@ -403,34 +486,46 @@ That would allow everything to stay on the stack as it does here, which has nice
     
     struct nlmsghdr nlh = { };
     struct genlmsghdr ge = { };
-    struct nlattr attr1 = { };
-    struct nlattr attr2 = { };
+    struct nlattr attr[2] = { };
 
-    attr1.nla_len = sizeof(attr1);
-    attr1.nla_type = NET_DM_ATTR_SW_DROPS;
-    attr2.nla_len = sizeof(attr2);
-    attr2.nla_type = NET_DM_ATTR_HW_DROPS;
+    int fl = 0; // count flags
+    if(sw) {
+      attr[fl].nla_len = sizeof(struct nlattr);
+      attr[fl].nla_type = NET_DM_ATTR_SW_DROPS;
+      fl++;
+    }
+    if(hw) {
+      attr[fl].nla_len = sizeof(struct nlattr);
+      attr[fl].nla_type = NET_DM_ATTR_HW_DROPS;
+      fl++;
+    }
+
+    if(fl == 0) {
+      // no-op
+      return 0;
+    }
 
     ge.cmd = startIt
       ? NET_DM_CMD_START
       : NET_DM_CMD_STOP;
     ge.version = 1;
 
-    nlh.nlmsg_len = NLMSG_LENGTH(sizeof(ge) + sizeof(attr1) + sizeof(attr2));
+    nlh.nlmsg_len = NLMSG_LENGTH(sizeof(ge) + (fl * sizeof(struct nlattr)));
     nlh.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
     nlh.nlmsg_type = mdata->family_id;
     nlh.nlmsg_seq = ++mdata->nl_seq;
     nlh.nlmsg_pid = UTNLGeneric_pid(mod->id);
 
+    // There will be either 3 or 4 elements in this msg
     struct iovec iov[4] = {
       { .iov_base = &nlh,  .iov_len = sizeof(nlh) },
       { .iov_base = &ge,   .iov_len = sizeof(ge) },
-      { .iov_base = &attr1, .iov_len = sizeof(attr1) },
-      { .iov_base = &attr2, .iov_len = sizeof(attr2) },
+      { .iov_base = &attr[0], .iov_len = sizeof(struct nlattr) },
+      { .iov_base = &attr[1], .iov_len = sizeof(struct nlattr) },
     };
 
     struct sockaddr_nl sa = { .nl_family = AF_NETLINK };
-    struct msghdr msg = { .msg_name = &sa, .msg_namelen = sizeof(sa), .msg_iov = iov, .msg_iovlen = 4 };
+				 struct msghdr msg = { .msg_name = &sa, .msg_namelen = sizeof(sa), .msg_iov = iov, .msg_iovlen = (2 + fl) };
     return sendmsg(mdata->nl_sock, &msg, 0);
   }
 
@@ -485,7 +580,7 @@ That would allow everything to stay on the stack as it does here, which has nice
     char *msg = (char *)NLMSG_DATA(nlh);
     int msglen = nlh->nlmsg_len - NLMSG_HDRLEN;
     struct genlmsghdr *genl = (struct genlmsghdr *)msg;
-    myDebug(1, "generic netlink CMD = %u", genl->cmd);
+    EVDebug(mod, 1, "generic netlink CMD = %u", genl->cmd);
 
     for(int offset = GENL_HDRLEN; offset < msglen; ) {
       struct nlattr *attr = (struct nlattr *)(msg + offset);
@@ -501,21 +596,21 @@ That would allow everything to stay on the stack as it does here, which has nice
 	break;
       case CTRL_ATTR_FAMILY_ID:
 	mdata->family_id = *(uint16_t *)attr_datap;
-	myDebug(1, "generic family id: %u", mdata->family_id); 
+	EVDebug(mod, 1, "generic family id: %u", mdata->family_id); 
 	break;
       case CTRL_ATTR_FAMILY_NAME:
-	myDebug(1, "generic family name: %s", attr_datap); 
+	EVDebug(mod, 1, "generic family name: %s", attr_datap); 
 	break;
       case CTRL_ATTR_HDRSIZE:
 	mdata->headerSize = *(uint32_t *)attr_datap;
-	myDebug(1, "generic family headerSize: %u", mdata->headerSize); 
+	EVDebug(mod, 1, "generic family headerSize: %u", mdata->headerSize); 
 	break;
       case CTRL_ATTR_MAXATTR:
 	mdata->maxAttr = *(uint32_t *)attr_datap;
-	myDebug(1, "generic family maxAttr: %u", mdata->maxAttr);
+	EVDebug(mod, 1, "generic family maxAttr: %u", mdata->maxAttr);
 	break;
       case CTRL_ATTR_OPS:
-	myDebug(1, "generic family OPS");
+	EVDebug(mod, 1, "generic family OPS");
 	break;
       case CTRL_ATTR_MCAST_GROUPS:
 	for(int grp_offset = NLA_HDRLEN; grp_offset < attr->nla_len;) {
@@ -538,11 +633,11 @@ That would allow everything to stay on the stack as it does here, which has nice
 	    switch(gf_attr->nla_type) {
 	    case CTRL_ATTR_MCAST_GRP_NAME:
 	      grp_name = grp_attr_datap;
-	      myDebug(1, "dropmon multicast group: %s", grp_name); 
+	      EVDebug(mod, 1, "multicast group: %s", grp_name); 
 	      break;
 	    case CTRL_ATTR_MCAST_GRP_ID:
 	      grp_id = *(uint32_t *)grp_attr_datap;
-	      myDebug(1, "dropmon multicast group id: %u", grp_id); 
+	      EVDebug(mod, 1, "multicast group id: %u", grp_id); 
 	      break;
 	    }
 	    gf_offset += NLMSG_ALIGN(gf_attr->nla_len);
@@ -550,7 +645,7 @@ That would allow everything to stay on the stack as it does here, which has nice
 	  if(mdata->state == HSP_DROPMON_STATE_GET_FAMILY
 	     && grp_name
 	     && grp_id == NET_DM_GRP_ALERT) {
-	    myDebug(1, "dropmon found group %s=%u", grp_name, grp_id);
+	    EVDebug(mod, 1, "found group %s=%u", grp_name, grp_id);
 	    mdata->group_id = grp_id;
 	    // could go ahead and run configure_DROPMON, start_DROPMON
 	    // here, but want that logic to be down in evt_tick() so
@@ -561,7 +656,7 @@ That would allow everything to stay on the stack as it does here, which has nice
 	}
 	break;
       default:
-	myDebug(1, "dropmon attr type: %u (nested=%u) len: %u",
+	EVDebug(mod, 1, "attr type: %u (nested=%u) len: %u",
 		attr->nla_type,
 		attr->nla_type & NLA_F_NESTED,
 		attr->nla_len);
@@ -577,13 +672,26 @@ That would allow everything to stay on the stack as it does here, which has nice
     SFL_DS_SET(search.dsi, 0, ifIndex, 0);
     SFLNotifier *notifier = UTHashGet(mdata->notifiers, &search);
     if(!notifier) {
-      SEMLOCK_DO(sp->sync_agent) {
-	notifier = sfl_agent_addNotifier(sp->agent, &search.dsi);
-	sfl_notifier_set_sFlowEsReceiver(notifier, HSP_SFLOW_RECEIVER_INDEX);
-      }
+      notifier = sfl_agent_addNotifier(sp->agent, &search.dsi);
+      sfl_notifier_set_sFlowEsReceiver(notifier, HSP_SFLOW_RECEIVER_INDEX);
       UTHashAdd(mdata->notifiers, notifier);
     }
     return notifier;
+  }
+
+  /*_________________---------------------------__________________
+    _________________      hideDrop             __________________
+    -----------------___________________________------------------
+  */
+
+  static bool hideDrop(EVMod *mod, char *dropStr) {
+    HSP *sp = (HSP *)EVROOTDATA(mod);
+    if((dropStr
+	&& regexec(sp->dropmon.hide_regex, dropStr, 0, NULL, 0) == 0)) {
+      EVDebug(mod, 4, "hw drop (%s) hidden by regex\n", dropStr);
+      return YES;
+    }
+    return NO;
   }
 
   /*_________________---------------------------__________________
@@ -599,53 +707,59 @@ That would allow everything to stay on the stack as it does here, which has nice
     u_char *msg = (u_char *)NLMSG_DATA(nlh);
     int msglen = nlh->nlmsg_len - NLMSG_HDRLEN;
     struct genlmsghdr *genl = (struct genlmsghdr *)msg;
-    myDebug(1, "dropmon netlink (type=%u) CMD = %u", nlh->nlmsg_type, genl->cmd);
+    EVDebug(mod, 3, "netlink (type=%u) CMD = %u", nlh->nlmsg_type, genl->cmd);
     
     // sFlow strutures to fill in
     SFLEvent_discarded_packet discard = { .reason = SFLDrop_unknown };
     SFLFlow_sample_element hdrElem = { .tag=SFLFLOW_HEADER };
     SFLFlow_sample_element fnElem = { .tag=SFLFLOW_EX_FUNCTION };
+    SFLFlow_sample_element hwElem = { .tag=SFLFLOW_EX_HW_TRAP };
+    SFLFlow_sample_element rnElem = { .tag=SFLFLOW_EX_LINUX_REASON };
+    
     // and some parameters to pick up for cross-check below
     uint32_t trunc_len=0;
     uint32_t orig_len=0;
+    uint16_t skb_protocol=0;
     char *hw_group=NULL;
     char *hw_name=NULL;
     char *sw_symbol=NULL;
+    char *reason=NULL;
 
+    // increment counter for threshold check
+    mdata->totalDrops_thisTick++;
+    
     struct nlattr *attr = (struct nlattr *)(msg + GENL_HDRLEN);
     int len = msglen - GENL_HDRLEN;
     while(UTNLA_OK(attr, len)) {
-      // increment counter for threshold check
-      mdata->totalDrops_thisTick++;
 
       u_char *datap = UTNLA_DATA(attr);
       int datalen = UTNLA_PAYLOAD(attr);
       
-      if(debug(1)) {
+      if(EVDebug(mod, 4, NULL)) {
 	u_char hex[1024];
 	printHex(datap, datalen, hex, 1023, YES);
-	myDebug(1, "nla_type=%u, datalen=%u, payload=%s", attr->nla_type, datalen, hex);
+	EVDebug(mod, 4, "nla_type=%u, datalen=%u, payload=%s", attr->nla_type, datalen, hex);
       }
 
       bool nested = attr->nla_type & NLA_F_NESTED;
       int attributeType = attr->nla_type & ~NLA_F_NESTED;
       switch(attributeType) {
       case NET_DM_ATTR_ALERT_MODE:
-	myDebug(3, "dropmon: u8=ALERT_MODE=%u", *(uint8_t *)datap);
+	EVDebug(mod, 4, "u8=ALERT_MODE=%u", *(uint8_t *)datap);
 	// enum net_dm_alert_mode NET_DM_ALERT_MODE_PACKET == 1
 	// TODO: what to do if not packet?
 	break;
       case NET_DM_ATTR_PC:
-	myDebug(3, "dropmon: u64=PC=0x%"PRIx64, *(uint64_t *)datap);
+	EVDebug(mod, 4, "u64=PC=0x%"PRIx64, *(uint64_t *)datap);
 	break;
       case NET_DM_ATTR_SYMBOL:
-	myDebug(3, "dropmon: string=ATTR_SYMBOL=%s", datap);
+	EVDebug(mod, 4, "string=ATTR_SYMBOL=%s", datap);
 	sw_symbol = (char *)datap;
 	break;
       case NET_DM_ATTR_IN_PORT:
-	myDebug(3, "dropmon: nested=IN_PORT");
+	EVDebug(mod, 4, "nested=IN_PORT");
 	if(!nested) {
-	  myDebug(2, "dropmon: forcing NET_DM_ATTR_IN_PORT to be interpreted as nested attribute");
+	  EVDebug(mod, 4, "forcing NET_DM_ATTR_IN_PORT to be interpreted as nested attribute");
 	  nested = YES;
 	}
 	if(nested) {
@@ -654,11 +768,11 @@ That would allow everything to stay on the stack as it does here, which has nice
 	  while(UTNLA_OK(port_attr, port_len)) {
 	    switch(port_attr->nla_type) {
 	    case NET_DM_ATTR_PORT_NETDEV_IFINDEX:
-	      myDebug(3, "dropmon: u32=NETDEV_IFINDEX=%u", *(uint32_t *)UTNLA_DATA(port_attr));
+	      EVDebug(mod, 4, "u32=NETDEV_IFINDEX=%u", *(uint32_t *)UTNLA_DATA(port_attr));
 	      discard.input = *(uint32_t *)UTNLA_DATA(port_attr);
 	      break;
 	    case NET_DM_ATTR_PORT_NETDEV_NAME:
-	      myDebug(3, "dropmon: string=NETDEV_NAME=%s", (char *)UTNLA_DATA(port_attr));
+	      EVDebug(mod, 4, "string=NETDEV_NAME=%s", (char *)UTNLA_DATA(port_attr));
 	      break;
 	    }
 	    port_attr = UTNLA_NEXT(port_attr, port_len);
@@ -666,64 +780,71 @@ That would allow everything to stay on the stack as it does here, which has nice
 	}
 	break;
       case NET_DM_ATTR_TIMESTAMP:
-	myDebug(3, "dropmon: u64=TIMESTAMP=%"PRIu64, *(uint64_t *)datap);
+	EVDebug(mod, 4, "u64=TIMESTAMP=%"PRIu64, *(uint64_t *)datap);
 	break;
       case NET_DM_ATTR_PROTO:
-	myDebug(3, "dropmon: u16=PROTO=0x%04x", *(uint16_t *)datap);
-	// TODO: do we need to interpret protocol = 0x0800 as IPv4 and 0x86DD as IPv6?
-	// We seem to get MAC layer here, but will that always be the case?
+	skb_protocol = *(uint16_t *)datap;
+	EVDebug(mod, 4, "u16=PROTO=0x%04x", skb_protocol);
+	// This is the skb->protocol field e.g. 0x0800 for IP.
+	// Local only packet with have all-zeros smac and dmac.
+	// When unused buffers are freed (e.g. in skb_queue_purge())
+	// they appear here with PROTO==0. Those we choose to ignore.
 	break;
       case NET_DM_ATTR_PAYLOAD:
-	myDebug(3, "dropmon: PAYLOAD");
+	EVDebug(mod, 4, "PAYLOAD");
 	hdrElem.flowType.header.header_length = datalen;
 	hdrElem.flowType.header.header_bytes = datap;
 	hdrElem.flowType.header.stripped = 4;
 	break;
       case NET_DM_ATTR_PAD:
-	myDebug(3, "dropmon: PAD");
+	EVDebug(mod, 4, "PAD");
 	break;
       case NET_DM_ATTR_TRUNC_LEN:
-	myDebug(3, "dropmon: u32=TRUNC_LEN=%u", *(uint32_t *)datap);
+	EVDebug(mod, 4, "u32=TRUNC_LEN=%u", *(uint32_t *)datap);
 	trunc_len = *(uint32_t *)datap;
 	break;
       case NET_DM_ATTR_ORIG_LEN:
-	myDebug(3, "dropmon: u32=ORIG_LEN=%u", *(uint32_t *)datap);
+	EVDebug(mod, 4, "u32=ORIG_LEN=%u", *(uint32_t *)datap);
 	orig_len = *(uint32_t *)datap;
 	break;
       case NET_DM_ATTR_QUEUE_LEN:
-	myDebug(3, "dropmon: u32=QUEUE_LEN=%u", *(uint32_t *)datap);
+	EVDebug(mod, 4, "u32=QUEUE_LEN=%u", *(uint32_t *)datap);
 	break;
       case NET_DM_ATTR_STATS:
-	myDebug(3, "dropmon: nested=ATTR_STATS");
+	EVDebug(mod, 4, "nested=ATTR_STATS");
 	break;
       case NET_DM_ATTR_HW_STATS:
-	myDebug(3, "dropmon: nested=HW_STATS");
+	EVDebug(mod, 4, "nested=HW_STATS");
 	break;
       case NET_DM_ATTR_ORIGIN:
-	myDebug(3, "dropmon: u16=ORIGIN=%u", *(uint16_t *)datap);
+	EVDebug(mod, 4, "u16=ORIGIN=%u", *(uint16_t *)datap);
 	break;
       case NET_DM_ATTR_HW_TRAP_GROUP_NAME:
-	myDebug(3, "dropmon: string=TRAP_GROUP_NAME=%s", datap);
+	EVDebug(mod, 4, "string=TRAP_GROUP_NAME=%s", datap);
 	hw_group = (char *)datap;
 	break;
       case NET_DM_ATTR_HW_TRAP_NAME:
-	myDebug(3, "dropmon: string=TRAP_NAME=%s", datap);
+	EVDebug(mod, 4, "string=TRAP_NAME=%s", datap);
 	hw_name = (char *)datap;
 	break;
       case NET_DM_ATTR_HW_ENTRIES:
-	myDebug(3, "dropmon: nested=HW_ENTRIES");
+	EVDebug(mod, 4, "nested=HW_ENTRIES");
 	break;
       case NET_DM_ATTR_HW_ENTRY:
-	myDebug(3, "dropmon: nested=HW_ENTRY");
+	EVDebug(mod, 4, "nested=HW_ENTRY");
 	break;
       case NET_DM_ATTR_HW_TRAP_COUNT:
-	myDebug(3, "dropmon: u32=SW_DROPS=%u", *(uint32_t *)datap);
+	EVDebug(mod, 4, "u32=SW_DROPS=%u", *(uint32_t *)datap);
 	break;
       case NET_DM_ATTR_SW_DROPS:
-	myDebug(3, "dropmon: flag=SW_DROPS");
+	EVDebug(mod, 4, "flag=SW_DROPS");
 	break;
       case NET_DM_ATTR_HW_DROPS:
-	myDebug(3, "dropmon: flag=HW_DROPS");
+	EVDebug(mod, 4, "flag=HW_DROPS");
+	break;
+      case NET_DM_ATTR_REASON:
+	EVDebug(mod, 4, "string=REASON=%s", datap);
+	reason = (char *)datap;
 	break;
       }
       attr = UTNLA_NEXT(attr, len);
@@ -747,28 +868,44 @@ That would allow everything to stay on the stack as it does here, which has nice
     if(!hdrElem.flowType.header.header_protocol)
       hdrElem.flowType.header.header_protocol = SFLHEADER_ETHERNET_ISO8023;
 
-    // look up drop point
+    // look up drop point - allowing fallback if muliple attrs were supplied
     HSPDropPoint *dp = NULL;
-    if(hw_name)
+    if(reason)
+      dp = getDropPoint_rn(mod, reason);
+    if((dp == NULL
+	|| dp->reason == SFLDrop_unknown)
+       && hw_name)
       dp = getDropPoint_hw(mod, hw_group, hw_name);
-    else if(sw_symbol)
+    if((dp == NULL
+	|| dp->reason == SFLDrop_unknown)
+       && sw_symbol)
       dp = getDropPoint_sw(mod, sw_symbol);
+    
     if(dp == NULL
-       || dp->reason == -1) {
+       || dp->reason == -1
+       || skb_protocol == 0) {
       // this one not considered a packet-drop, so ignore it.
-      myDebug(3, "trap not considered a drop. Ignoring.");
+      EVDebug(mod, 4, "trap not considered a drop. Ignoring.");
       return;
     }
     
-    myDebug(1, "found dropPoint %s reason_code=%u", dp->dropPoint, dp->reason);
+    EVDebug(mod, 1, "found dropPoint %s reason_code=%u", dp->dropPoint, dp->reason);
+
+    if(sp->dropmon.hide_regex_str) {
+      if(hideDrop(mod, hw_name)
+	 || hideDrop(mod, sw_symbol)
+	 || hideDrop(mod, reason))
+	return;
+    }
     
     // fill in discard reason
     discard.reason = dp->reason;
 
     // apply rate-limit
     if(mdata->quota <= 0) {
-      myDebug(1, "dropmon: rate-limit (%u/sec) exceeded. Dropping drop", sp->dropmon.limit);
+      EVDebug(mod, 2, "rate-limit (%u/sec) exceeded. Dropping drop", sp->dropmon.limit);
       mdata->noQuota++;
+      sp->telemetry[HSP_TELEMETRY_EVENT_SAMPLES_SUPPRESSED]++;
       return;
     }
     else
@@ -778,7 +915,9 @@ That would allow everything to stay on the stack as it does here, which has nice
     discard.drops = mdata->noQuota;
 
     // look up notifier
-    SFLNotifier *notifier = getSFlowNotifier(mod, discard.input);
+    // We can just use one datasource for this (0:0) - especially since the
+    // input and output fields may not be limited stricting to phyical ports
+    SFLNotifier *notifier = getSFlowNotifier(mod, 0);
 
     // enforce notifier limit on header size
     if (hdrElem.flowType.header.header_length > notifier->sFlowEsMaximumHeaderSize)
@@ -786,16 +925,35 @@ That would allow everything to stay on the stack as it does here, which has nice
 
     SFLADD_ELEMENT(&discard, &hdrElem);
 
-    // include function struct (only for sw events).
+    // include raw strings too.  Helpful for debugging or if the
+    // curated sFlow drop code does not capture a new trap.
+    if(hw_name) {
+      hwElem.flowType.hw_trap.group.str = hw_group;
+      hwElem.flowType.hw_trap.group.len = my_strlen(hw_group);
+      hwElem.flowType.hw_trap.trap.str = hw_name;
+      hwElem.flowType.hw_trap.trap.len = my_strlen(hw_name);
+      SFLADD_ELEMENT(&discard, &hwElem);
+    }
     if(sw_symbol) {
-      fnElem.flowType.function.symbol.str = dp->dropPoint;
-      fnElem.flowType.function.symbol.len = my_strlen(dp->dropPoint);
+      fnElem.flowType.function.symbol.str = sw_symbol;
+      fnElem.flowType.function.symbol.len = my_strlen(sw_symbol);
       SFLADD_ELEMENT(&discard, &fnElem);
     }
+    if(reason) {
+      rnElem.flowType.linux_reason.reason.str = reason;
+      rnElem.flowType.linux_reason.reason.len = my_strlen(reason);
+      SFLADD_ELEMENT(&discard, &rnElem);
+    }
 
-    SEMLOCK_DO(sp->sync_agent) {
+    HSPPendingEvtSample es = { .notifier = notifier, .discard = &discard };
+    if(mdata->evt_intf_es)
+      EVEventTx(mod, mdata->evt_intf_es, &es, sizeof(es));
+    if(es.suppress) {
+      sp->telemetry[HSP_TELEMETRY_EVENT_SAMPLES_SUPPRESSED]++;
+    }
+    else {
       sfl_notifier_writeEventSample(notifier, &discard);
-      sp->telemetry[HSP_TELEMETRY_COUNTER_SAMPLES]++;
+      sp->telemetry[HSP_TELEMETRY_EVENT_SAMPLES]++;
     }
 
     // first successful event confirms we are up and running
@@ -833,7 +991,7 @@ That would allow everything to stay on the stack as it does here, which has nice
       int numbytes = recv(sock->fd, recv_buf, sizeof(recv_buf), 0);
       if(numbytes <= 0)
 	break;
-      myDebug(1, "dropmon: readNetlink_DROPMON - msg = %d bytes", numbytes);
+      EVDebug(mod, 4, "readNetlink_DROPMON - msg = %d bytes", numbytes);
       struct nlmsghdr *nlh = (struct nlmsghdr*) recv_buf;
       while(NLMSG_OK(nlh, numbytes)){
 	if(nlh->nlmsg_type == NLMSG_DONE)
@@ -841,11 +999,11 @@ That would allow everything to stay on the stack as it does here, which has nice
 	if(nlh->nlmsg_type == NLMSG_ERROR){
 	  struct nlmsgerr *err_msg = (struct nlmsgerr *)NLMSG_DATA(nlh);
 	  if(err_msg->error == 0) {
-	    myDebug(1, "received Netlink ACK");
+	    EVDebug(mod, 4, "received Netlink ACK");
 	  }
 	  else {
 	    // TODO: parse NLMSGERR_ATTR_OFFS to get offset?  Might be helpful
-	    myDebug(1, "dropmon state %u: error in netlink message: %d : %s",
+	    EVDebug(mod, 4, "state %u: error in netlink message: %d : %s",
 		    mdata->state,
 		    err_msg->error,
 		    strerror(-err_msg->error));
@@ -862,7 +1020,7 @@ That would allow everything to stay on the stack as it does here, which has nice
 
     // This should have advanced the state past GET_FAMILY
     if(mdata->state == HSP_DROPMON_STATE_GET_FAMILY) {
-      myDebug(1, "dropmon: failed to get family details - wait before trying again");
+      EVDebug(mod, 1, "failed to get family details - wait before trying again");
       setState(mod, HSP_DROPMON_STATE_WAIT);
       mdata->retry_countdown = HSP_DROPMON_WAIT_RETRY_S;
     }
@@ -880,11 +1038,28 @@ That would allow everything to stay on the stack as it does here, which has nice
     if(mdata->dropmon_disabled)
       return;
 
-    myDebug(1, "dropmon: evt_config_changed configured=%s", mdata->dropmon_configured ? "YES" : "NO");
+    EVDebug(mod, 1, "evt_config_changed configured=%s", mdata->dropmon_configured ? "YES" : "NO");
     
     if(sp->sFlowSettings == NULL)
       return; // no config (yet - may be waiting for DNS-SD)
-  
+
+    if(sp->sFlowSettings->dropLimit_set) {
+      // dynamic override of dropLimit
+      sp->dropmon.limit = sp->sFlowSettings->dropLimit;
+      if(sp->dropmon.limit > 0) {
+	// dropLimit was set to positive integer in SONiC or DNS-SD.
+	// This implies that we should activate the feed even if dropmon.start is currently off,
+	// but we still assume that hardware DROPMON activation happens elsewhere.
+	// TODO: We may have to revisit this if our activation of sw drops here
+	// obstructs that activation of hw drops elsewhere.
+	EVDebug(mod, 1, "limit set dynamically=%u => start=YES", sp->dropmon.limit);
+	sp->dropmon.start = YES;
+	sp->dropmon.sw = YES;
+	sp->dropmon.rn = YES;
+	sp->dropmon.hw_passive = YES;
+      }
+    }
+
     if(mdata->dropmon_configured) {
       // already configured from the first time (when we still had root privileges)
       return;
@@ -922,12 +1097,12 @@ That would allow everything to stay on the stack as it does here, which has nice
       // TODO: may want to confirm that none of the parameters were
       // changed under our feet too?
       if(mdata->feedControlErrors > 0) {
-	myDebug(1, "dropmon: detected feed-control errors: %u", mdata->feedControlErrors);
-	myDebug(1, "dropmon: assume external control - not stopping feed");
+	EVDebug(mod, 1, "detected feed-control errors: %u", mdata->feedControlErrors);
+	EVDebug(mod, 1, "assume external control - not stopping feed");
       }
       else {
-	myDebug(1, "dropmon: graceful shutdown: turning off feed");
-	start_DROPMON(mod, NO);
+	EVDebug(mod, 1, "graceful shutdown: turning off feed");
+	start_DROPMON(mod, NO, sp->dropmon.sw, sp->dropmon.hw);
       }
     }
     if(mdata->nl_evsock) {
@@ -951,9 +1126,9 @@ That would allow everything to stay on the stack as it does here, which has nice
     // check circuit-breaker threshold
     if(sp->dropmon.max
        && mdata->totalDrops_thisTick > sp->dropmon.max) {
-      myDebug(1, "dropmon: threshold exceeded (%u > %u): turning off feed",
-	      mdata->totalDrops_thisTick,
-	      sp->dropmon.max);
+      EVDebug(mod, 0, "threshold exceeded (%u > %u): turning off feed",
+	    mdata->totalDrops_thisTick,
+	    sp->dropmon.max);
       stopMonitoring(mod);
       mdata->dropmon_disabled = YES;
     }
@@ -986,7 +1161,7 @@ That would allow everything to stay on the stack as it does here, which has nice
 		 ? HSP_DROPMON_STATE_JOIN_GROUP
 		 : HSP_DROPMON_STATE_RUN);
       else {
-	myDebug(1, "dropmon: failed to join group - wait before trying again");
+	EVDebug(mod, 1, "failed to join group - wait before trying again");
 	setState(mod, HSP_DROPMON_STATE_WAIT);
 	mdata->retry_countdown = HSP_DROPMON_WAIT_RETRY_S;
       }
@@ -1000,7 +1175,7 @@ That would allow everything to stay on the stack as it does here, which has nice
       // failure if the channel was already configured externally.
       // TODO: should probably wait for answer before ploughing
       // ahead with this start_DROPMON call.
-      start_DROPMON(mod, YES);
+      start_DROPMON(mod, YES, sp->dropmon.sw, sp->dropmon.hw);
       break;
     case HSP_DROPMON_STATE_START:
       // waiting for start response
@@ -1056,11 +1231,13 @@ That would allow everything to stay on the stack as it does here, which has nice
     mod->data = my_calloc(sizeof(HSP_mod_DROPMON));
     HSP_mod_DROPMON *mdata = (HSP_mod_DROPMON *)mod->data;
     if(sp->dropmon.start)
-      retainRootRequest(mod, "needed to start drop-monitor netlink feed.");
+      retainRootRequest(mod, "need CAP_NET_ADMIN to start drop-monitor netlink feed.");
     mdata->dropPoints_hw = UTHASH_NEW(HSPDropPoint, dropPoint, UTHASH_SKEY);
     mdata->dropPoints_sw = UTHASH_NEW(HSPDropPoint, dropPoint, UTHASH_SKEY);
+    mdata->dropPoints_rn = UTHASH_NEW(HSPDropPoint, dropPoint, UTHASH_SKEY);
     mdata->dropPatterns_hw = UTArrayNew(UTARRAY_DFLT);
     mdata->dropPatterns_sw = UTArrayNew(UTARRAY_DFLT);
+    mdata->dropPatterns_rn = UTArrayNew(UTARRAY_DFLT);
     mdata->notifiers = UTHASH_NEW(SFLNotifier, dsi, UTHASH_DFLT);
     loadDropPoints(mod);
     mdata->packetBus = EVGetBus(mod, HSPBUS_PACKET, YES);
@@ -1068,6 +1245,7 @@ That would allow everything to stay on the stack as it does here, which has nice
     EVEventRx(mod, EVGetEvent(mdata->packetBus, EVEVENT_TICK), evt_tick);
     EVEventRx(mod, EVGetEvent(mdata->packetBus, EVEVENT_DECI), evt_deci);
     EVEventRx(mod, EVGetEvent(mdata->packetBus, EVEVENT_FINAL), evt_final);
+    mdata->evt_intf_es = EVGetEvent(mdata->packetBus, HSPEVENT_INTF_EVENT_SAMPLE);
   }
 
 #if defined(__cplusplus)

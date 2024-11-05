@@ -40,7 +40,7 @@ ifeq ($(GCOV),yes)
 endif
 
 #########  object files  #########
-FEATURES_ALL= ULOG NFLOG PSAMPLE DROPMON PCAP TCP DOCKER KVM XEN NVML OVS CUMULUS DENT OS10 OPX SONIC DBUS SYSTEMD EAPI CONTAINERD CONTAINERDGO
+FEATURES_ALL= ULOG NFLOG PSAMPLE DROPMON PCAP TCP DOCKER KVM XEN NVML OVS CUMULUS DENT OS10 OPX SONIC DBUS SYSTEMD EAPI CONTAINERD CONTAINERDGO K8S NLROUTE VPP
 FEATURES_CUMULUS= CUMULUS NFLOG PSAMPLE SYSTEMD DROPMON
 FEATURES_DENTOS= DENT PSAMPLE SYSTEMD DROPMON
 FEATURES_EOS= EAPI
@@ -48,7 +48,9 @@ FEATURES_OS10= OS10 DBUS SYSTEMD
 FEATURES_OPX= OPX DBUS SYSTEMD
 FEATURES_SONIC= SONIC PSAMPLE DOCKER DROPMON
 FEATURES_XEN= XEN OVS
-FEATURES_HOST= NFLOG PCAP TCP DOCKER KVM OVS DBUS SYSTEMD PSAMPLE DENT DROPMON
+FEATURES_HOST= NFLOG PCAP TCP DOCKER KVM OVS DBUS SYSTEMD PSAMPLE DENT DROPMON NLROUTE
+FEATURES_CONTAINERD= CONTAINERDGO
+FEATURES_VPP= VPP PSAMPLE DROPMON
 
 BINDIR     ?= /usr/sbin
 INITDIR    ?= /etc/init.d
@@ -57,6 +59,7 @@ MODDIR     ?= /etc/hsflowd/modules
 SYSTEMDDIR ?= /lib/systemd/system
 DBUSDIR    ?= /etc/dbus-1/system.d
 
+# in FEATURES2 every token has spaces before and after
 FEATURES2=" $(FEATURES) "
 $(info $$FEATURES is [$(FEATURES)] from $(origin FEATURES))
 $(info $$FEATURES2 is [$(FEATURES2)] from $(origin FEATURES))
@@ -118,7 +121,25 @@ ifneq ($(shell echo $(FEATURES2)|grep -c " HOST "),0)
   XTGTS += $(FEATURES_HOST)
 endif
 
+ifneq ($(shell echo $(FEATURES2)|grep -c " VPP "),0)
+  XTGTS += $(FEATURES_VPP)
+endif
+
+# CONTAINERD and K8S require CONTAINERDGO, but it is
+# easier not to capture this dependency so that the
+# Go program can more easily be compiled separately
+# (e.g. using golang docker hub image)
+#ifneq ($(shell echo $(FEATURES2)|grep -c " CONTAINERD "),0)
+#  XTGTS += $(FEATURES_CONTAINERD)
+#endif
+#ifneq ($(shell echo $(FEATURES2)|grep -c " K8S "),0)
+#  XTGTS += $(FEATURES_CONTAINERD)
+#endif
+
+# in XTGTS2 every token has spaces before and after
+XTGTS2=" $(XTGTS) "
 $(info $$XTGTS is [$(XTGTS)])
+$(info $$XTGTS2 is [$(XTGTS2)])
 
 # alternative mount points (to support hsflowd running in container
 # and/or with no root privileges)
@@ -168,23 +189,48 @@ LD=gcc
 OPT_ALL= -O3 -DNDEBUG
 OPT_REG= -g -O2
 OPT_DBG= -g -ggdb
+
+# use "UTHEAP=no OPT=-g" to turn off buffer-recycling
+# so that "valgrind --leak-check=yes hsflowd -d" can find leaks.
+ifndef UTHEAP
+  UTHEAP=yes
+endif
+
 ifndef OPT
   OPT=$(OPT_REG)
+endif
+
+# option to use gperftools
+CFLAGS_GPROF=
+LDFLAGS_GPROF=
+LIBS_GPROF=
+ifeq ($(GPROF),yes)
+  CFLAGS_GPROF= -DGPROF -fno-builtin-malloc -fno-builtin-calloc -fno-builtin-realloc -fno-builtin-free
+  LDFLAGS_GPROF=
+  LIBS_GPROF= -ltcmalloc_and_profiler
+  LIBS_GPROF += -lunwind # only for 64-bit?
 endif
 
 # other source directories
 SFLOWDIR=../sflow
 JSONDIR=../json
 
-# CFLAGS and LIBS - common
+# CFLAGS and LIBS - for hsflowd main
 CFLAGS_HSFLOWD= -I. -I$(JSONDIR) -I$(SFLOWDIR)
+LDFLAGS_HSFLOWD= -rdynamic
+LDFLAGS_HSFLOWD += $(LDFLAGS_GCOV)
+LDFLAGS_HSFLOWD += $(LDFLAGS_GPROF)
 LIBS_HSFLOWD= $(JSONDIR)/libcjson.a $(SFLOWDIR)/libsflow.a -lm -pthread -ldl -lrt
+LIBS_HSFLOWD += $(LIBS_GPROF)
 
+# CFLAGS and LIBS - for all shared-library modules
 CFLAGS_SHARED= -fPIC
-LDFLAGS_SHARED= -shared $(LDFLAGS_GCOV)
+LDFLAGS_SHARED= -shared
+LDFLAGS_SHARED += $(LDFLAGS_GCOV)
+LDFLAGS_SHARED += $(LDFLAGS_GPROF)
 # LDFLAGS_SHARED += --build-id
 
-# CFLAGS and LIBS - modules
+# CFLAGS and LIBS - for individual modules
 CFLAGS_JSON=
 LIBS_JSON=
 
@@ -194,6 +240,7 @@ LIBS_DNSSD=-lresolv
 CFLAGS_XEN=
 LIBS_XEN= -lxenstore -lxenctrl
 
+# KVM requires libvirt-del(el), libxml2-dev(el)
 CFLAGS_KVM= -I/usr/include/libvirt -I/usr/include/libxml2
 LIBS_KVM= -lvirt -lxml2
 
@@ -203,6 +250,7 @@ LIBS_DOCKER= -lm
 CFLAGS_ULOG=
 LIBS_ULOG=
 
+# NFLOG requires libnfnetlink-dev(el)
 CFLAGS_NFLOG= -I/usr/include/libnfnetlink
 LIBS_NFLOG= -lnfnetlink
 
@@ -212,12 +260,14 @@ LIBS_PSAMPLE=
 CFLAGS_DROPMON=
 LIBS_DROPMON=
 
+# PCAP requires libpcap-dev(el)
 CFLAGS_PCAP=
 LIBS_PCAP=-lpcap
 
-CFLAGS_TCP= -DHSP_INET_DIAG_USE_DUMP_UDP
+CFLAGS_TCP=
 LIBS_TCP=
 
+# For dependencies, compile using CUDA docker image
 CFLAGS_NVML ?= -I/usr/local/cuda/include/
 LIBDIR_NVML ?= /usr/local/cuda/lib64/stubs/
 LIBS_NVML= -L$(LIBDIR_NVML) -lnvidia-ml
@@ -231,6 +281,7 @@ LIBS_DENT=
 CFLAGS_OVS=
 LIBS_OVS=
 
+# OPX requires libsystemd-daemon-dev
 CFLAGS_OPX= -I/usr/include/opx
 LIBS_OPX= -lsystemd -lopx_cps_api_common -lopx_cps_class_map
 # For OS10 the same libraries are under different names:
@@ -239,37 +290,54 @@ ifneq ($(shell echo $(FEATURES2)|grep -c " OS10 "),0)
   LIBS_OPX= -lsystemd -lcps-api-common -lcps-class-map-util
 endif
 
+# SONIC requires libhiredis-dev(el)
 CFLAGS_SONIC=
 LIBS_SONIC=-lhiredis
 ifeq ($(REDISONLY),yes)
   CFLAGS_SONIC += -DHSP_SONIC_TEST_REDISONLY
 endif
 
+# DBUS requires dbus-dev(el) or libdbus-1-dev
 CFLAGS_DBUS=$(shell pkg-config dbus-1 --cflags)
 LIBS_DBUS=$(shell pkg-config dbus-1 --libs)
 
 CFLAGS_NETLINK=
 LIBS_NETLINK=
 
+# SYSTEMD requires DBUS, (lib)uuid-dev(el), openssl-dev(el)
 CFLAGS_SYSTEMD=$(CFLAGS_DBUS)
-LIBS_SYSTEMD=$(LIBS_DBUS) -lcrypto
+LIBS_SYSTEMD=$(LIBS_DBUS) -luuid -lcrypto
 
 CFLAGS_EAPI=
 LIBS_EAPI=
 
-CFLAGS_CONTAINERD=
+# CONTAINERD requires golang, openssl-dev(el)
+CFLAGS_CONTAINERD=-Wno-deprecated-declarations
 LIBS_CONTAINERD= -lm -lcrypto
+
+# K8S requires golang, (lib)uuid-dev(el)
+CFLAGS_K8S=
+LIBS_K8S= -lm -luuid
+
+CFLAGS_NLROUTE=
+LIBS_NLROUTE=
+
+CFLAGS_VPP=
+LIBS_VPP=
 
 # common CFLAGS and LIBS	
 CFLAGS = $(CFLAGS_HSFLOWD) $(CFLAGS_LOAD) $(CFLAGS_SHARED) $(OPT) -D_GNU_SOURCE -DHSP_VERSION=$(VERSION)
 CFLAGS += $(CFLAGS_MOUNTPOINTS)
-CFLAGS += -DUTHEAP
+ifeq ($(UTHEAP),yes)
+  CFLAGS += -DUTHEAP
+endif
 CFLAGS += -DHSP_OPTICAL_STATS
 CFLAGS += -DHSP_MOD_DIR=$(MODDIR)
 CFLAGS += -Wall -Wstrict-prototypes -Wunused-value
 CFLAGS += -Wunused-function
 CFLAGS += $(CFLAGS_GCOV)
-LIBS=
+CFLAGS += $(CFLAGS_GPROF)
+CFLAGS += -DSFL_USE_SFDG -DSFL_USE_32BIT_INDEX
 
 # xs.h became xenstore.h by 6.5. Detect that and set a flag.  Could drive this by reading
 # /etc/redhat-release to get the version number as in xenserver-ddk/Makefile,  but then it
@@ -316,6 +384,9 @@ OBJS_DBUS=mod_dbus.o util_dbus.o
 OBJS_SYSTEMD=mod_systemd.o util_dbus.o util_netlink.o
 OBJS_EAPI=mod_eapi.o
 OBJS_CONTAINERD=mod_containerd.o
+OBJS_K8S=mod_k8s.o
+OBJS_NLROUTE=mod_nlroute.o util_netlink.o
+OBJS_VPP=mod_vpp.o util_netlink.o
 
 BUILDTGTS= mod_json.so \
            mod_dnssd.so \
@@ -373,10 +444,16 @@ CONTAINERD: mod_containerd.so
 
 CONTAINERDGO: hsflowd_containerd
 
+K8S: mod_k8s.so
+
+NLROUTE: mod_nlroute.so
+
+VPP: mod_vpp.so
+
 #########  hsflowd  #########
 
 hsflowd: $(OBJS_HSFLOWD) $(HEADERS)
-	$(CC) $(CFLAGS) -o $@ $(OBJS_HSFLOWD) $(LIBS) $(LIBS_HSFLOWD) -rdynamic
+	$(CC) $(CFLAGS) -o $@ $(OBJS_HSFLOWD) $(LIBS_HSFLOWD) $(LDFLAGS_HSFLOWD)
 
 #########  hsflowd_containerd  #########
 
@@ -384,8 +461,8 @@ hsflowd_containerd:
 	cd containerd; \
 	echo "=== go mod init hsflowd_containerd ==="; \
 	go mod init hsflowd_containerd; \
-	echo "=== go get github.com/containerd/containerd@v1.6.1 ==="; \
-	go get github.com/containerd/containerd@v1.6.1; \
+	echo "=== go get github.com/containerd/containerd@v1.6.26 ==="; \
+	go get github.com/containerd/containerd@v1.6.26; \
 	echo "=== go build hsflowd_containerd ==="; \
 	go build hsflowd_containerd; \
 	echo "=== compile hsflowd_containerd done ==="
@@ -580,6 +657,30 @@ mod_containerd.o: mod_containerd.c $(HEADERS)
 mod_containerd.so: $(OBJS_CONTAINERD)
 	$(LD) -o $@ $(OBJS_CONTAINERD) $(LDFLAGS_SHARED) $(LIBS_CONTAINERD)
 
+#----------------------------
+
+mod_k8s.o: mod_k8s.c $(HEADERS)
+	$(CC) $(CFLAGS) -c $*.c $(CFLAGS_K8S)
+
+mod_k8s.so: $(OBJS_K8S)
+	$(LD) -o $@ $(OBJS_K8S) $(LDFLAGS_SHARED) $(LIBS_K8S)
+
+#----------------------------
+
+mod_nlroute.o: mod_nlroute.c $(HEADERS)
+	$(CC) $(CFLAGS) -c $*.c $(CFLAGS_NLROUTE)
+
+mod_nlroute.so: $(OBJS_NLROUTE)
+	$(LD) -o $@ $(OBJS_NLROUTE) $(LDFLAGS_SHARED) $(LIBS_NLROUTE)
+
+#----------------------------
+
+mod_vpp.o: mod_vpp.c $(HEADERS)
+	$(CC) $(CFLAGS) -c $*.c  $(CFLAGS_VPP)
+
+mod_vpp.so: $(OBJS_VPP)
+	$(LD) -o $@ $(OBJS_VPP) $(LDFLAGS_SHARED) $(LIBS_VPP)
+
 
 #########  install  #########
 
@@ -598,7 +699,7 @@ ifneq ($(strip $(HSFLOWD_DBUS_CONF)),)
 	$(INSTALL) -d $(DBUS_D)
 	$(INSTALL) -m 644 $(HSFLOWD_DBUS_CONF) $(DBUS_D)
 endif
-ifneq ($(shell echo $(FEATURES2)|grep -c " CONTAINERDGO "),0)
+ifneq ($(shell echo $(XTGTS2)|grep -c " CONTAINERDGO "),0)
 	$(INSTALL) -m 700 containerd/hsflowd_containerd $(BIN_D)
 endif
 
@@ -628,7 +729,7 @@ clean:
 
 #########  dependencies  #########
 
-.c.o: $(HEADERS)
+.c.o:
 	$(CC) $(CFLAGS) -c $*.c
 
 util.o: util.c $(HEADERS)
@@ -665,3 +766,6 @@ mod_dbus.o: mod_dbus.c $(HEADERS)
 mod_systemd.o: mod_systemd.c $(HEADERS)
 mod_eapi.o: mod_eapi.c $(HEADERS)
 mod_containerd.o: mod_containerd.c $(HEADERS)
+mod_k8s.o: mod_k8s.c $(HEADERS)
+mod_nlroute.o: mod_nlroute.c $(HEADERS)
+mod_vpp.o: mod_vpp.c $(HEADERS)

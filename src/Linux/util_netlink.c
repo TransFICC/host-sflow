@@ -15,21 +15,61 @@ extern "C" {
 
   char *UTNLDiag_sockid_print(struct inet_diag_sockid *sockid) {
     static char buf[256];
-    snprintf(buf, 256, "%08x:%08x:%08x:%08x %u - %08x:%08x:%08x:%08x %u if:%u",
-	     sockid->idiag_src[0],
-	     sockid->idiag_src[1],
-	     sockid->idiag_src[2],
-	     sockid->idiag_src[3],
-	     sockid->idiag_sport,
-	     sockid->idiag_dst[0],
-	     sockid->idiag_dst[1],
-	     sockid->idiag_dst[2],
-	     sockid->idiag_dst[3],
-	     sockid->idiag_dport,
-	     sockid->idiag_if);
+    snprintf(buf, 256, "%08x:%08x:%08x:%08x %u - %08x:%08x:%08x:%08x %u if:%u cookie: %0x8:%08x",
+	     ntohl(sockid->idiag_src[0]),
+	     ntohl(sockid->idiag_src[1]),
+	     ntohl(sockid->idiag_src[2]),
+	     ntohl(sockid->idiag_src[3]),
+	     ntohs(sockid->idiag_sport),
+	     ntohl(sockid->idiag_dst[0]),
+	     ntohl(sockid->idiag_dst[1]),
+	     ntohl(sockid->idiag_dst[2]),
+	     ntohl(sockid->idiag_dst[3]),
+	     ntohs(sockid->idiag_dport),
+	     ntohl(sockid->idiag_if),
+	     ntohl(sockid->idiag_cookie[0]),
+	     ntohl(sockid->idiag_cookie[1]));
     return buf;
   }
 
+  /*__________________---------------------------__________________
+    __________________ UTNLDiag_sockid_normalize __________________
+    ------------------___________________________------------------
+  */
+
+  bool UTNLDiag_sockid_normalize(struct inet_diag_sockid *sockid) {
+    bool rewritten = NO;
+    if(sockid->idiag_src[0] == 0
+       && sockid->idiag_src[1] == 0
+       && ntohl(sockid->idiag_src[2]) == 0xFFFF) {
+      // convert v4-as-v6 to v4
+      sockid->idiag_src[0] = sockid->idiag_src[3];
+      sockid->idiag_src[2] = 0;
+      sockid->idiag_src[3] = 0;
+      rewritten = YES;
+    }
+    if(sockid->idiag_dst[0] == 0
+       && sockid->idiag_dst[1] == 0
+       && ntohl(sockid->idiag_dst[2]) == 0xFFFF) {
+      // convert v4-as-v6 to v4
+      sockid->idiag_dst[0] = sockid->idiag_dst[3];
+      sockid->idiag_dst[2] = 0;
+      sockid->idiag_dst[3] = 0;
+      rewritten = YES;
+    }
+    if(sockid->idiag_if) {
+      sockid->idiag_if = 0;
+      rewritten = YES;
+    }
+    if(sockid->idiag_cookie[0] != INET_DIAG_NOCOOKIE
+       || sockid->idiag_cookie[1] != INET_DIAG_NOCOOKIE) {
+      sockid->idiag_cookie[0] = INET_DIAG_NOCOOKIE;
+      sockid->idiag_cookie[1] = INET_DIAG_NOCOOKIE;
+      rewritten = YES;
+    }
+    return rewritten;
+  }
+       
   /*_________________---------------------------__________________
     _________________      UTNLDiag_send        __________________
     -----------------___________________________------------------
@@ -200,6 +240,129 @@ extern "C" {
     return sendmsg(sockfd, &msg, 0);
   }
 
+
+  /*_________________---------------------------__________________
+    _________________    UTNLRoute_open         __________________
+    -----------------___________________________------------------
+  */
+
+  int UTNLRoute_open(uint32_t mod_id, bool nonBlocking, size_t bufferSize) {
+    int nl_sock = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+    if(nl_sock < 0) {
+      myLog(LOG_ERR, "UTNLRoute_open: open failed: %s", strerror(errno));
+      return -1;
+    }
+
+    // bind to a suitable id
+    struct sockaddr_nl sa = {
+      .nl_family = AF_NETLINK,
+      .nl_pid = getpid()  /* UTNLGeneric_pid(mod_id) */
+    };
+    if(bind(nl_sock, (struct sockaddr *)&sa, sizeof(sa)) < 0)
+      myLog(LOG_ERR, "UTNLRoute_open: bind failed: %s", strerror(errno));
+
+    // Depending on how this socket is used it may be necessary to increase
+    // the allocated kernel buffer space to avoid ENOBUFS errors.
+    if(bufferSize)
+      UTSocketRcvbuf(nl_sock, bufferSize);
+    if(nonBlocking)
+      setNonBlocking(nl_sock);
+    setCloseOnExec(nl_sock);
+    return nl_sock;
+  }
+
+  /*_________________---------------------------__________________
+    _________________      UTNLRoute_send       __________________
+    -----------------___________________________------------------
+  */
+
+  int UTNLRoute_send(int sockfd, uint32_t mod_id, uint32_t ifIndex, uint field, uint32_t seqNo) {
+    struct nlmsghdr nlh = { };
+    struct ifinfomsg inf = { };
+    struct rtattr rta = { };
+
+    nlh.nlmsg_len = NLMSG_LENGTH(sizeof(inf));
+    nlh.nlmsg_flags = NLM_F_REQUEST;
+    nlh.nlmsg_type = RTM_GETLINK;
+    nlh.nlmsg_seq = seqNo;
+    nlh.nlmsg_pid = UTNLGeneric_pid(mod_id);
+    inf.ifi_family = AF_UNSPEC;
+    inf.ifi_index = ifIndex;
+    inf.ifi_change = 0xffffffff;
+    rta.rta_type = field;
+    rta.rta_len = RTA_LENGTH(sizeof(field));
+
+    struct iovec iov[3] = {
+      { .iov_base = &nlh,  .iov_len = sizeof(nlh) },
+      { .iov_base = &inf,  .iov_len = sizeof(inf) },
+      { .iov_base = &rta,  .iov_len = sizeof(rta) },
+    };
+
+    struct sockaddr_nl sa = { .nl_family = AF_NETLINK };
+    struct msghdr msg = { .msg_name = &sa, .msg_namelen = sizeof(sa), .msg_iov = iov, .msg_iovlen = 3 };
+    return sendmsg(sockfd, &msg, 0);
+  }
+
+  /*_________________---------------------------__________________
+    _________________      UTNLRoute_recv       __________________
+    -----------------___________________________------------------
+  */
+
+  int UTNLRoute_recv(int sockfd, uint field, uint32_t *pIfIndex, char *resultBuf, uint *pResultLen) {
+    uint8_t recv_buf[HSP_READNL_RCV_BUF];
+    int rc;
+  try_again:
+    rc = recv(sockfd, recv_buf, HSP_READNL_RCV_BUF, 0);
+    if(rc < 0) {
+      if(errno == EAGAIN || errno == EINTR)
+	goto try_again;
+    }
+    if (rc > 0) {
+      struct nlmsghdr *recv_hdr = (struct nlmsghdr*)recv_buf;
+      struct ifinfomsg *infomsg = NLMSG_DATA(recv_hdr);
+      // report the ifIndex that was found
+      *pIfIndex = infomsg->ifi_index;
+      struct rtattr *rta = IFLA_RTA(infomsg);
+      int len = recv_hdr->nlmsg_len;
+      // this only writes into resultBuf if field is found
+      while (RTA_OK(rta, len)){
+	if(rta->rta_type == field) {
+	  char *res = RTA_DATA(rta);
+	  uint res_len = RTA_PAYLOAD(rta);
+	  if(res_len > *pResultLen)
+	    res_len = *pResultLen; // truncate if result buffer too short
+	  else
+	    *pResultLen = res_len;
+	  memcpy(resultBuf, res, res_len);
+	}
+	rta = RTA_NEXT(rta, len);
+      }
+    }
+    return rc;
+  }
+
+  /*_________________---------------------------__________________
+    _________________    UTNLUsersock_open      __________________
+    -----------------___________________________------------------
+  */
+
+  int UTNLUsersock_open(uint32_t mod_id) {
+    int nl_sock = socket(AF_NETLINK, SOCK_RAW, NETLINK_USERSOCK);
+    if(nl_sock < 0) {
+      myLog(LOG_ERR, "nl_sock open failed: %s", strerror(errno));
+      return -1;
+    }
+
+    // bind to the given id
+    struct sockaddr_nl sa = { .nl_family = AF_NETLINK,
+			      .nl_pid = mod_id };
+    if(bind(nl_sock, (struct sockaddr *)&sa, sizeof(sa)) < 0)
+      myLog(LOG_ERR, "UTNLUsersock_open: bind failed: %s", strerror(errno));
+
+    setNonBlocking(nl_sock);
+    setCloseOnExec(nl_sock);
+    return nl_sock;
+  }
 
 #if defined(__cplusplus)
 } /* extern "C" */

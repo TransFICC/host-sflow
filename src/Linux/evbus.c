@@ -9,6 +9,10 @@ extern "C" {
 #include "util.h"
 #include "evbus.h"
 
+#ifdef GPROF
+#include "gperftools/profiler.h"
+#endif
+
   // only one running bus in each thread - keep track with thread-local var
   // so we can always know what the current "home" bus is and detect
   // inter-bus (inter-thread) messages automatically in EVEventTx
@@ -463,6 +467,10 @@ extern "C" {
   }
 
   static void *busRun(void *magic) {
+#ifdef GPROF
+    myDebug(1, "GPROF ProfilerRegisterThread()");
+    ProfilerRegisterThread();
+#endif
     EVBus *bus = (EVBus *)magic;
     EVMod *mod = bus->root->rootModule;
     assert(bus->running == NO);
@@ -475,6 +483,7 @@ extern "C" {
     EVEvent *final = EVGetEvent(bus, EVEVENT_FINAL);
     EVEvent *end = EVGetEvent(bus, EVEVENT_END);
 
+    EVClockMono(&bus->tstart);
     EVEventTx(mod, start, NULL, 0);
 
     for(;;) {
@@ -503,6 +512,10 @@ extern "C" {
     return NULL;
   }
 
+  int EVBusRunningTime_mS(EVBus *bus) {
+    return EVTimeDiff_mS(&bus->tstart, &bus->now);
+  }
+  
   void EVBusRunThread(EVBus *bus, size_t stacksize) {
     // Set a more conservative stacksize here - partly because
     // we don't need more,  but mostly because Debian was refusing
@@ -709,6 +722,22 @@ extern "C" {
       msg->count++;
     }
   }
+
+  bool EVDebug(EVMod *mod, int level, char *fmt, ...) {
+    if((mod
+	&& mod->debugLevel >= level)
+       || debug(level)) {
+      if(fmt) {
+	myLog2(level, NO, LOG_DEBUG, "%s:", mod->name);
+	va_list args;
+	va_start(args, fmt);
+	myLogv2(level, YES, LOG_DEBUG, fmt, args);
+      }
+      return YES;
+    }
+    return NO;
+  }
+
 
 #if defined(__cplusplus)
 } /* extern "C" */

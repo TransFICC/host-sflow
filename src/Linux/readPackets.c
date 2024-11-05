@@ -12,214 +12,25 @@ extern "C" {
 #include <netinet/ip.h>
 #include <netinet/ip6.h>
 
-  /*_________________-----------------------------------__________________
-    _________________   agentCB_getCounters_interface   __________________
-    -----------------___________________________________------------------
-  */
-
-  static void agentCB_getCounters_interface(void *magic, SFLPoller *poller, SFL_COUNTERS_SAMPLE_TYPE *cs)
-  {
-    assert(poller->magic);
-    HSP *sp = (HSP *)poller->magic;
-
-    assert(EVCurrentBus() == sp->pollBus);
-
-    // device name was copied as userData
-    char *devName = (char *)poller->userData;
-
-    if(devName) {
-      // look up the adaptor objects
-      SFLAdaptor *adaptor = adaptorByName(sp, devName);
-      if(adaptor) {
-
-	// make sure the counters are up to the second
-	updateNioCounters(sp, adaptor);
-
-	HSPAdaptorNIO *adaptorNIO = ADAPTOR_NIO(adaptor);
-
-	// see if we were able to discern multicast and broadcast counters
-	// by polling for ethtool stats.  Be careful to use unsigned 32-bit
-	// arithmetic here:
-#define UNSUPPORTED_SFLOW_COUNTER32 (uint32_t)-1
-	uint32_t pkts_in = adaptorNIO->nio.pkts_in;
-	uint32_t pkts_out = adaptorNIO->nio.pkts_out;
-	uint32_t mcasts_in =  UNSUPPORTED_SFLOW_COUNTER32;
-	uint32_t mcasts_out =  UNSUPPORTED_SFLOW_COUNTER32;
-	uint32_t bcasts_in =  UNSUPPORTED_SFLOW_COUNTER32;
-	uint32_t bcasts_out =  UNSUPPORTED_SFLOW_COUNTER32;
-	uint32_t unknown_in =  UNSUPPORTED_SFLOW_COUNTER32;
-	uint32_t ifStatus = adaptorNIO->up ? (SFLSTATUS_ADMIN_UP | SFLSTATUS_OPER_UP) : 0;
-
-	// more detailed counters may have been found via ethtool or equivalent:
-	if(adaptorNIO->et_found & HSP_ETCTR_MC_IN) {
-	  mcasts_in = (uint32_t)adaptorNIO->et_total.mcasts_in;
-	  if(adaptorNIO->procNetDev)
-	    pkts_in -= mcasts_in;
-	}
-	if(adaptorNIO->et_found & HSP_ETCTR_BC_IN) {
-	  bcasts_in = (uint32_t)adaptorNIO->et_total.bcasts_in;
-	  if(adaptorNIO->procNetDev)
-	    pkts_in -= bcasts_in;
-	}
-	if(adaptorNIO->et_found & HSP_ETCTR_MC_OUT) {
-	  mcasts_out = (uint32_t)adaptorNIO->et_total.mcasts_out;
-	  if(adaptorNIO->procNetDev)
-	    pkts_out -= mcasts_out;
-	}
-	if(adaptorNIO->et_found & HSP_ETCTR_BC_OUT) {
-	  bcasts_out = (uint32_t)adaptorNIO->et_total.bcasts_out;
-	  if(adaptorNIO->procNetDev)
-	    pkts_out -= bcasts_out;
-	}
-	if(adaptorNIO->et_found & HSP_ETCTR_UNKN) {
-	  unknown_in = (uint32_t)adaptorNIO->et_total.unknown_in;
-	}
-	if((adaptorNIO->et_found & HSP_ETCTR_ADMIN)
-	   && (adaptorNIO->et_found & HSP_ETCTR_OPER)) {
-	  ifStatus = 0;
-	  if((adaptorNIO->et_last.adminStatus & 1)) ifStatus |= SFLSTATUS_ADMIN_UP;
-	  if((adaptorNIO->et_last.operStatus & 1)) ifStatus |= SFLSTATUS_OPER_UP;
-	}
-
-	if(debug(1)) {
-	  if(adaptorNIO->bond_master) {
-	    myDebug(1, "bond interface status: %s=%u (ifSpeed=%"PRIu64" dirn=%u et_found=%u up=%u)",
-		    adaptor->deviceName,
-		    ifStatus,
-		    adaptor->ifSpeed,
-		    adaptor->ifDirection,
-		    adaptorNIO->et_found,
-		    adaptorNIO->up);
-	  }
-	}
-
-	// generic interface counters
-	SFLCounters_sample_element elem = { 0 };
-	elem.tag = SFLCOUNTERS_GENERIC;
-	elem.counterBlock.generic.ifIndex = poller->dsi.ds_index;
-	elem.counterBlock.generic.ifType = 6; // assume ethernet
-	elem.counterBlock.generic.ifSpeed = adaptor->ifSpeed;
-	elem.counterBlock.generic.ifDirection = adaptor->ifDirection;
-	elem.counterBlock.generic.ifStatus = ifStatus;
-	elem.counterBlock.generic.ifPromiscuousMode = adaptor->promiscuous;
-	elem.counterBlock.generic.ifInOctets = adaptorNIO->nio.bytes_in;
-	elem.counterBlock.generic.ifInUcastPkts = pkts_in;
-	elem.counterBlock.generic.ifInMulticastPkts = mcasts_in;
-	elem.counterBlock.generic.ifInBroadcastPkts = bcasts_in;
-	elem.counterBlock.generic.ifInDiscards = adaptorNIO->nio.drops_in;
-	elem.counterBlock.generic.ifInErrors = adaptorNIO->nio.errs_in;
-	elem.counterBlock.generic.ifInUnknownProtos = unknown_in;
-	elem.counterBlock.generic.ifOutOctets = adaptorNIO->nio.bytes_out;
-	elem.counterBlock.generic.ifOutUcastPkts = pkts_out;
-	elem.counterBlock.generic.ifOutMulticastPkts = mcasts_out;
-	elem.counterBlock.generic.ifOutBroadcastPkts = bcasts_out;
-	elem.counterBlock.generic.ifOutDiscards = adaptorNIO->nio.drops_out;
-	elem.counterBlock.generic.ifOutErrors = adaptorNIO->nio.errs_out;
-	SFLADD_ELEMENT(cs, &elem);
-
-	if(adaptorNIO->vm_or_container) {
-#define HSP_DIRECTION_SWAP(g,f) do {				\
-	    uint32_t _tmp = g.ifIn ## f;			\
-	    g.ifIn ## f = g.ifOut ## f;				\
-	    g.ifOut ## f = _tmp; } while(0)
-	  HSP_DIRECTION_SWAP(elem.counterBlock.generic, UcastPkts);
-	  HSP_DIRECTION_SWAP(elem.counterBlock.generic, MulticastPkts);
-	  HSP_DIRECTION_SWAP(elem.counterBlock.generic, BroadcastPkts);
-	  HSP_DIRECTION_SWAP(elem.counterBlock.generic, Discards);
-	  HSP_DIRECTION_SWAP(elem.counterBlock.generic, Errors);
-	}
-
-	// add optional interface name struct
-	SFLCounters_sample_element pn_elem = { 0 };
-	pn_elem.tag = SFLCOUNTERS_PORTNAME;
-	char *sFlowPortName = devName;
-	// It might be more elegant to splice in an alternative PORTNAME element
-	// later in mod_sonic evt_cntr_sample() but there is an IFLA_IFALIAS
-	// that we might someday discover via netlink and want to export as
-	// the portName even on other platforms, so allow the policy to to be
-	// a global flag that we test here.  For now the flag is
-	// sp->sonic.setIfName but it could end up as something like "sp->portNameUseAlias".
-	if(sp->sonic.setIfName
-	   && adaptorNIO->deviceAlias)
-	  sFlowPortName = adaptorNIO->deviceAlias;
-	pn_elem.counterBlock.portName.portName.len = my_strlen(sFlowPortName);
-	pn_elem.counterBlock.portName.portName.str = sFlowPortName;
-	SFLADD_ELEMENT(cs, &pn_elem);
-
-	// possibly include LACP struct for bond slave
-	// (used to send for bond-master too,  but that
-	// was a mis-reading of the standard).
-	SFLCounters_sample_element lacp_elem = { 0 };
-	if(/*adaptorNIO->bond_master
-	     ||*/ adaptorNIO->bond_slave) {
-	  updateBondCounters(sp, adaptor);
-	  lacp_elem.tag = SFLCOUNTERS_LACP;
-	  lacp_elem.counterBlock.lacp = adaptorNIO->lacp; // struct copy
-	  SFLADD_ELEMENT(cs, &lacp_elem);
-	}
-
-	// possibly include SFP struct with optical gauges
-	SFLCounters_sample_element sfp_elem = { 0 };
-	if(adaptorNIO->sfp.num_lanes) {
-	  sfp_elem.tag = SFLCOUNTERS_SFP;
-	  sfp_elem.counterBlock.sfp = adaptorNIO->sfp; // struct copy - picks up lasers list
-	  SFLADD_ELEMENT(cs, &sfp_elem);
-	}
-
-	// circulate the cs to be annotated by other modules before it is sent out.
-	// This differs from the packet-sample treatment in that everything is
-	// on the stack.  If we ever wanted to delay counter samples until additional
-	// lookups were performed then this would all have to shift onto the heap.
-	HSPPendingCSample ps = { .poller = poller, .cs = cs };
-	EVEvent *evt_intf_cs = EVGetEvent(sp->pollBus, HSPEVENT_INTF_COUNTER_SAMPLE);
-	// TODO: can we specify pollBus only? Receiving this on another bus would
-	// be a disaster as we would not copy the whole structure here.
-	EVEventTx(sp->rootModule, evt_intf_cs, &ps, sizeof(ps));
-	// TODO: use HSPPendingCSample for HSPEVENT_HOST_COUNTER_SAMPLE too?
-	// (might be useful to consumers to get pointer to the poller too).
-	if(ps.suppress) {
-	  sp->telemetry[HSP_TELEMETRY_COUNTER_SAMPLES_SUPPRESSED]++;
-	}
-	else {
-	  SEMLOCK_DO(sp->sync_agent) {
-	    sfl_poller_writeCountersSample(poller, cs);
-	    sp->counterSampleQueued = YES;
-	    sp->telemetry[HSP_TELEMETRY_COUNTER_SAMPLES]++;
-	  }
-	}
-      }
-    }
-  }
-
-  static void agentCB_getCounters_interface_request(void *magic, SFLPoller *poller, SFL_COUNTERS_SAMPLE_TYPE *cs)
-  {
-    HSP *sp = (HSP *)poller->magic;
-    UTArrayAdd(sp->pollActions, poller);
-    UTArrayAdd(sp->pollActions, agentCB_getCounters_interface);
-  }
 
   /*_________________---------------------------__________________
     _________________       getPoller           __________________
     -----------------___________________________------------------
   */
 
-  static SFLPoller *getPoller(HSP *sp, SFLAdaptor *adaptor)
+  static void getPoller(HSP *sp, SFLAdaptor *adaptor)
   {
     HSPAdaptorNIO *adaptorNIO = ADAPTOR_NIO(adaptor);
     if(adaptorNIO->poller == NULL) {
-      SFLDataSource_instance dsi;
-      SFL_DS_SET(dsi, 0, adaptor->ifIndex, 0); // ds_class,ds_index,ds_instance
-      SEMLOCK_DO(sp->sync_agent) {
-	adaptorNIO->poller = sfl_agent_addPoller(sp->agent, &dsi, sp, agentCB_getCounters_interface_request);
-	sfl_poller_set_sFlowCpInterval(adaptorNIO->poller, sp->actualPollingInterval);
-	sfl_poller_set_sFlowCpReceiver(adaptorNIO->poller, HSP_SFLOW_RECEIVER_INDEX);
-	// remember the device name to make the lookups easier later.
-	// Don't want to point directly to the SFLAdaptor or SFLAdaptorNIO object
-	// in case it gets freed at some point.  The device name is enough.
-	adaptorNIO->poller->userData = (void *)my_strdup(adaptor->deviceName);
+      // Make sure we don't queue a flurry of requests by limiting to one per second
+      time_t now_mono_S = EVCurrentBus()->now.tv_sec;
+      if(adaptorNIO->poller_requested != now_mono_S) {
+	adaptorNIO->poller_requested = now_mono_S;
+	// message this request to the pollBus
+	EVEvent *req_poller = EVGetEvent(sp->pollBus, HSPEVENT_REQUEST_POLLER);
+	EVEventTx(sp->rootModule, req_poller, &adaptor->ifIndex, sizeof(adaptor->ifIndex));
       }
     }
-    return adaptorNIO->poller;
   }
 
   /*_________________---------------------------__________________
@@ -227,8 +38,8 @@ extern "C" {
     -----------------___________________________------------------
   */
 
-  SFLPoller *forceCounterPolling(HSP *sp, SFLAdaptor *adaptor) {
-    return getPoller(sp, adaptor);
+  void forceCounterPolling(HSP *sp, SFLAdaptor *adaptor) {
+    getPoller(sp, adaptor);
   }
 
   /*_________________---------------------------__________________
@@ -242,12 +53,12 @@ extern "C" {
     if(adaptorNIO->sampler == NULL) {
       SFLDataSource_instance dsi;
       SFL_DS_SET(dsi, 0, adaptor->ifIndex, 0); // ds_class,ds_index,ds_instance
-      // add sampler
-      SEMLOCK_DO(sp->sync_agent) {
-	adaptorNIO->sampler = sfl_agent_addSampler(sp->agent, &dsi);
-	sfl_sampler_set_sFlowFsReceiver(adaptorNIO->sampler, HSP_SFLOW_RECEIVER_INDEX);
-	sfl_sampler_set_sFlowFsMaximumHeaderSize(adaptorNIO->sampler, sp->sFlowSettings_file->headerBytes);
-      }
+      // add sampler to packet-bus agent
+      adaptorNIO->sampler = sfl_agent_addSampler(sp->agent, &dsi);
+      sfl_sampler_set_sFlowFsReceiver(adaptorNIO->sampler, HSP_SFLOW_RECEIVER_INDEX);
+      // TODO: adapt if headerBytes changes dynamically in config settings - broadcast event?
+      // same as for changes in polling interval or datagram size?
+      sfl_sampler_set_sFlowFsMaximumHeaderSize(adaptorNIO->sampler, sp->sFlowSettings->headerBytes);
     }
     return adaptorNIO->sampler;
   }
@@ -285,15 +96,21 @@ extern "C" {
   {
     if(--ps->refCount == 0) {
       EVBus *bus = EVCurrentBus();
+
+      // some consumers of packet-samples will want to wait until everyone has
+      // looked at it and released it before they process it. For example, mod_k8s
+      // wants the sample after any netlink DIAG lookup has been performed on it.
+      if(sp->evt_flow_sample_released == NULL)
+	sp->evt_flow_sample_released = EVGetEvent(bus, HSPEVENT_FLOW_SAMPLE_RELEASED);
+      EVEventTx(sp->rootModule, sp->evt_flow_sample_released, ps, sizeof(*ps));
+      
       if(ps->suppress) {
 	sp->telemetry[HSP_TELEMETRY_FLOW_SAMPLES_SUPPRESSED]++;
       }
       else {
-	SEMLOCK_DO(sp->sync_agent) {
-	  sfl_agent_set_now(ps->sampler->agent, bus->now.tv_sec, bus->now.tv_nsec);
-	  sfl_sampler_writeFlowSample(ps->sampler, ps->fs);
-	  sp->telemetry[HSP_TELEMETRY_FLOW_SAMPLES]++;
-	}
+	sfl_agent_set_now(ps->sampler->agent, bus->now.tv_sec, bus->now.tv_nsec);
+	sfl_sampler_writeFlowSample(ps->sampler, ps->fs);
+	sp->telemetry[HSP_TELEMETRY_FLOW_SAMPLES]++;
       }
       void *ptr;
       UTARRAY_WALK(ps->ptrsToFree, ptr)
@@ -317,20 +134,21 @@ extern "C" {
 
   void takeSample(HSP *sp, SFLAdaptor *ad_in, SFLAdaptor *ad_out, SFLAdaptor *ad_tap, uint32_t options, uint32_t hook, const u_char *mac_hdr, uint32_t mac_len, const u_char *cap_hdr, uint32_t cap_len, uint32_t pkt_len, uint32_t drops, uint32_t sampling_n, SFLFlow_sample_element *extended_elements)
   {
-
-    if(getDebug() > 1) {
+    EVMod *mod = sp->rootModule;
+    if(EVDebug(mod, 2, NULL)) {
       u_char macdst[13], macsrc[13];
       macdst[0]='\0';
       macsrc[0]='\0';
       uint16_t ethtype = 0;
-      if(mac_len == 14) {
+      if(mac_hdr
+	 && mac_len == 14) {
 	printHex(mac_hdr+6,6,macsrc,12,NO);
 	macsrc[12] = '\0';
 	printHex(mac_hdr+0,6,macdst,12,NO);
 	macdst[12] = '\0';
 	ethtype = (mac_hdr[12] << 8) + mac_hdr[13];
       }
-      myLog(LOG_INFO, "takeSample: hook=%u tap=%s in=%s out=%s pkt_len=%u cap_len=%u mac_len=%u (%s -> %s et=0x%04X)",
+      EVDebug(mod, 1, "takeSample: hook=%u tap=%s in=%s out=%s pkt_len=%u cap_len=%u mac_len=%u (%s -> %s et=0x%04X)",
 	    hook,
 	    ad_tap ? ad_tap->deviceName : "<no tap>",
 	    ad_in ? ad_in->deviceName : "<not found>",
@@ -362,11 +180,9 @@ extern "C" {
 	bridgeModel = YES;
       SFLAdaptor *ad_in_global = adaptorByPeerIndex(sp, ad_in->ifIndex);
       if(ad_in_global) {
-	if(getDebug()) {
-	  myLog(LOG_INFO, "  GlobalNS veth peer ad_in=%s(%u)",
+	EVDebug(mod, 1, "GlobalNS veth peer ad_in=%s(%u)",
 		ad_in_global->deviceName,
 		ad_in_global->ifIndex);
-	}
 	bridgeModel = YES;
 	ad_in = ad_in_global;
       }
@@ -376,11 +192,9 @@ extern "C" {
 	bridgeModel = YES;
       SFLAdaptor *ad_out_global = adaptorByPeerIndex(sp, ad_out->ifIndex);
       if(ad_out_global) {
-	if(getDebug()) {
-	  myLog(LOG_INFO, "  GlobalNS veth peer ad_out=%s(%u)",
+	EVDebug(mod, 1, "GlobalNS veth peer ad_out=%s(%u)",
 		ad_out_global->deviceName,
 		ad_out_global->ifIndex);
-	}
 	bridgeModel = YES;
 	ad_out = ad_out_global;
       }
@@ -447,10 +261,10 @@ extern "C" {
     // must have a sampler_dev with an ifIndex
     if(sampler_dev == NULL
        || sampler_dev->ifIndex == 0) {
-      myDebug(1, "warning: takeSample found no sampler_dev with ifIndex");
+      EVDebug(mod, 1, "warning: takeSample found no sampler_dev with ifIndex");
       return;
     }
-    myDebug(2, "selected sampler %s ifIndex=%u",
+    EVDebug(mod, 2, "selected sampler %s ifIndex=%u",
 	    sampler_dev->deviceName,
 	    sampler_dev->ifIndex);
     
@@ -472,6 +286,7 @@ extern "C" {
 
     // build the sampled header structure
     HSPPendingSample *ps = pendingSampleNew(sampler, fs);
+    bool sendPS = YES;
     SFLFlow_sample_element *hdrElem = pendingSample_calloc(ps, sizeof(SFLFlow_sample_element));
     hdrElem->tag = SFLFLOW_HEADER;
     uint32_t FCS_bytes = 4;
@@ -500,8 +315,11 @@ extern "C" {
     else {
       u_char ipversion = cap_hdr[0] >> 4;
       if(ipversion != 4 && ipversion != 6) {
-	if(getDebug()) myLog(LOG_ERR, "received non-IP packet. Encapsulation is unknown");
-	// TODO: clean up and bail?
+	EVDebug(mod, 1, "received non-IP packet. Encapsulation is unknown");
+	// still go through the motions so that everything is freed properly, but
+	// don't actually send out the sample.
+	sendPS = NO;
+	sp->telemetry[HSP_TELEMETRY_FLOW_SAMPLES_UNKNOWN]++;
       }
       else {
 	if(mac_len == 0) {
@@ -560,7 +378,8 @@ extern "C" {
     // wrap it and send it out in case someone else wants to annotate it
     if(sp->evt_flow_sample == NULL)
       sp->evt_flow_sample = EVGetEvent(EVCurrentBus(), HSPEVENT_FLOW_SAMPLE);
-    EVEventTx(sp->rootModule, sp->evt_flow_sample, ps, sizeof(*ps));
+    if(sendPS)
+      EVEventTx(sp->rootModule, sp->evt_flow_sample, ps, sizeof(*ps));
     releasePendingSample(sp, ps);
   }
 
@@ -598,6 +417,11 @@ extern "C" {
 	getPoller(sp, adaptor);
       }
     }
+
+    // because we are on pollBus here, we know that
+    // the above getPoller() requests will all have
+    // completed, so we can go ahead with planning the
+    // counter-polling batches here.
 
     // may want to cluster switch port polling into
     // batches that will go out together -- mostly
@@ -650,7 +474,11 @@ extern "C" {
       type_len = (ptr[0] << 8) + ptr[1];
       ptr += 2;
       
-      if(type_len == 0x8100) {
+      while(type_len == 0x8100
+	    || type_len == 0x88A8
+	    || type_len == 0x9100
+	    || type_len == 0x9200
+	    || type_len == 0x9300) {
 	// 802.1Q
 	if((end - ptr) < 4)
 	  return -1; // not enough for an 802.1Q header
@@ -770,6 +598,96 @@ extern "C" {
     -----------------___________________________------------------
   */
 
+  static void decodePendingSample_ipip(HSPPendingSample *ps) {
+    if(ps->ipproto == IPPROTO_IPIP
+       && ps->hdr_len >= (ps->l4_offset + 20 /* IPv4 */)) {
+      u_char *innerIP = ps->hdr + ps->l4_offset;
+      if(innerIP[0] == 0x45 /* version 4, header-length 20 */) {
+	ps->src_1.type = SFLADDRESSTYPE_IP_V4;
+	memcpy(&ps->src_1.address.ip_v4.addr, innerIP + 12, 4);
+	ps->dst_1.type = SFLADDRESSTYPE_IP_V4;
+	memcpy(&ps->dst_1.address.ip_v4.addr, innerIP + 16, 4);
+	ps->ipproto_1 = innerIP[9];
+	ps->gotInnerIP = YES;
+	ps->l4_offset += 20;
+	if(ps->ipproto_1 == 6
+	   || ps->ipproto_1 == 17) {
+	  u_char *ptr = ps->hdr + ps->l4_offset;
+	  ps->l4_sport_1 = (ptr[0] << 8) + ptr[1];
+	  ps->l4_dport_1 = (ptr[2] << 8) + ptr[3];
+	}
+      }
+    }
+  }
+  
+  static void decodePendingSample_vxlan(HSPPendingSample *ps) {
+    int ip_offset_1 = ps->l4_offset + 8 /* udp */ + 8 /* vxlan */ + 14 /* inner MAC */;
+    if(ps->ipproto == IPPROTO_UDP
+       && ps->hdr_len >= ip_offset_1) {
+      // Check for VXLAN(4789|8472) header at l4_offset,
+      // and if found, populate inner MAC and IP addrs.
+      // Perhaps also for Geneve(6801) and teredo(3544)?
+      // UDP Header: [sPort][dPort][pduLen][csum]
+      if(ps->l4_dport == 4789
+	 || ps->l4_dport == 8472) {
+	/* VXLAN Header: 
+	   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+ 
+	   |R|R|R|R|I|R|R|R|            Reserved                           | 
+	   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+ 
+	   |                VXLAN Network Identifier (VNI) |   Reserved    | 
+	   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+ 
+	*/
+	u_char *vxlan = ps->hdr + ps->l4_offset + 8;
+	if((vxlan[0] != 0x08)
+	   || (vxlan[1] != 0)
+	   || (vxlan[2] != 0)
+	   || (vxlan[3] != 0)
+	   || (vxlan[7] != 0)) {
+	  // only the "I" bit must be set - rest are reserved and should be zero
+	  return;
+	}
+	uint32_t vni = vxlan[4];
+	vni <<= 8;
+	vni += vxlan[5];
+	vni <<= 8;
+	vni += vxlan[6];
+	// assume not VXLAN if vni == 0
+	if(vni != 0) {
+	  ps->vxlan_vni = vni;
+	  u_char *mac_1 = vxlan + 8;
+	  // copy MAC addresses (or maybe we should just record offset to inner L2)?
+	  memcpy(ps->macdst_1.mac, mac_1, 6);
+	  memcpy(ps->macsrc_1.mac, mac_1 + 6, 6);
+	  ps->gotInnerMAC = YES;
+	  // check only for simplest IP encapsulation
+	  if(mac_1[12] == 0x08
+	     && mac_1[13] == 0x00
+	     && ps->hdr_len > (ip_offset_1 + 20)) {
+	    u_char *innerIP = mac_1 + 14;
+	    if(innerIP[0] == 0x45 /* version 4, header-length 20 */) {
+	      ps->src_1.type = SFLADDRESSTYPE_IP_V4;
+	      memcpy(&ps->src_1.address.ip_v4.addr, innerIP + 12, 4);
+	      ps->dst_1.type = SFLADDRESSTYPE_IP_V4;
+	      memcpy(&ps->dst_1.address.ip_v4.addr, innerIP + 16, 4);
+	      ps->ipproto_1 = innerIP[9];
+	      ps->gotInnerIP = YES;
+	      ps->l4_offset = ip_offset_1 + 20;
+	      if(ps->hdr_len > (ps->l4_offset + 4)
+		 && (ps->ipproto_1 == IPPROTO_TCP
+		     || ps->ipproto_1 == IPPROTO_UDP)) {
+		u_char *ptr = ps->hdr + ps->l4_offset;
+		ps->l4_sport_1 = (ptr[0] << 8) + ptr[1];
+		ps->l4_dport_1 = (ptr[2] << 8) + ptr[3];
+	      }
+	    }
+	  }
+	  // TODO: handle other L2 encapsulations
+	  // TODO: handle inner IPv6
+	}
+      }
+    }
+  } 
+	     
   int decodePendingSample(HSPPendingSample *ps) {
     if(!ps->decoded) {
       for(SFLFlow_sample_element *elem = ps->fs->elements; elem != NULL; elem = elem->nxt) {
@@ -779,7 +697,14 @@ extern "C" {
 	  ps->hdr_protocol = header->header_protocol;
 	  ps->hdr_len = header->header_length;
 	  ps->ipversion = decodePacketHeader(header, &ps->ipproto, &ps->l3_offset, &ps->l4_offset);
-	  // extract IP src/dst addresses too, since they are so likely to be used
+	  // The above just captures the main encapsulation offsets, but we also want
+	  // to pull out some of the fields that are most likely to be used for lookups.
+	  if(ps->hdr_protocol == SFLHEADER_ETHERNET_ISO8023) {
+	    // extract outer MAC addresses
+	    memcpy(ps->macdst.mac, ps->hdr, 6);
+	    memcpy(ps->macsrc.mac, ps->hdr + 6, 6);
+	  }
+	  // extract IP src/dst addresses
 	  if(ps->ipversion == 4) {
 	    ps->src.type = ps->dst.type = SFLADDRESSTYPE_IP_V4;
 	    memcpy(&ps->src.address.ip_v4, ps->hdr + ps->l3_offset + 12, 4);
@@ -790,7 +715,25 @@ extern "C" {
 	    memcpy(&ps->src.address.ip_v6, ps->hdr + ps->l3_offset + 8, 16);
 	    memcpy(&ps->dst.address.ip_v6, ps->hdr + ps->l3_offset + 24, 16);
 	  }
-	  break;
+	  // extract tunneled addresses
+	  if(ps->l4_offset) {
+	    u_char *ptr = ps->hdr + ps->l4_offset;
+	    switch(ps->ipproto) {
+	    case IPPROTO_TCP:
+	      ps->l4_sport = (ptr[0] << 8) + ptr[1];
+	      ps->l4_dport = (ptr[2] << 8) + ptr[3];
+	      break;
+	    case IPPROTO_UDP:
+	      ps->l4_sport = (ptr[0] << 8) + ptr[1];
+	      ps->l4_dport = (ptr[2] << 8) + ptr[3];
+	      decodePendingSample_vxlan(ps);
+	      break;
+	    case IPPROTO_IPIP:
+	      decodePendingSample_ipip(ps);
+	      break;
+	    }
+	  }
+	  break; // found header
 	}
       }
       ps->decoded = YES;

@@ -60,6 +60,7 @@ extern "C" {
     HSPOBJ_KVM,
     HSPOBJ_DOCKER,
     HSPOBJ_CONTAINERD,
+    HSPOBJ_K8S,
     HSPOBJ_ULOG,
     HSPOBJ_NFLOG,
     HSPOBJ_PSAMPLE,
@@ -76,7 +77,9 @@ extern "C" {
     HSPOBJ_DBUS,
     HSPOBJ_SYSTEMD,
     HSPOBJ_EAPI,
-    HSPOBJ_PORT
+    HSPOBJ_PORT,
+    HSPOBJ_NLROUTE,
+    HSPOBJ_VPP
   } EnumHSPObject;
 
   static const char *HSPObjectNames[] = {
@@ -89,6 +92,7 @@ extern "C" {
     "kvm",
     "docker",
     "containerd",
+    "k8s",
     "ulog",
     "nflog",
     "psample",
@@ -105,7 +109,9 @@ extern "C" {
     "dbus",
     "systemd",
     "eapi",
-    "port"
+    "port",
+    "nlroute",
+    "vpp"
   };
 
   static void copyApplicationSettings(HSPSFlowSettings *from, HSPSFlowSettings *to);
@@ -596,7 +602,7 @@ extern "C" {
     UTStrBuf *buf = UTStrBuf_new();
 
     if(settings) {
-      char ipbuf[51];
+      char ipbuf[64];
       UTStrBuf_printf(buf, "hostname=%s\n", sp->hostname);
       UTStrBuf_printf(buf, "sampling=%u\n", settings->samplingRate);
       UTStrBuf_printf(buf, "header=%u\n", settings->headerBytes);
@@ -616,7 +622,7 @@ extern "C" {
       // If these overrides are removed again in another dynamic update then we simply leave them
       // out here and it should trigger a return to the previous behavior.
       if(settings->agentIP.type)
-	UTStrBuf_printf(buf, "agentIP=%s\n", SFLAddress_print(&settings->agentIP, ipbuf, 50));
+	UTStrBuf_printf(buf, "agentIP=%s\n", SFLAddress_print(&settings->agentIP, ipbuf, 63));
       if(settings->agentDevice)
 	UTStrBuf_printf(buf, "agent=%s\n", settings->agentDevice);
 
@@ -629,13 +635,33 @@ extern "C" {
 	// this might mean we write a .auto file with no collectors in it,
 	// so let's hope the slave agents all do the right thing with that(!)
 	if(collector->ipAddr.type != SFLADDRESSTYPE_UNDEFINED) {
-	  char collectorStr[128];
-	  // ip/port/deviceName/namespace
-	  sprintf(collectorStr, "collector=%s/%u/%s/%s\n",
-		  SFLAddress_print(&collector->ipAddr, ipbuf, 50),
-		  collector->udpPort,
-		  collector->deviceName ?: "",
-		  collector->namespace ?: "");
+	  char collectorStr[HSP_MAX_LINELEN];
+	  // the evt_config_line syntax uses collector=ip/port/deviceName/namespace
+	  // and the dnsSD and SONiC modules pass config lines around that way, but here we
+	  // need to preserve the original collector=IP[ PORT] syntax so that unmodified
+	  // sub-agents reading this file (such as mod_sflow for apache, nginx-sflow-module
+	  // and jmx-sflow-agent) all see what they were expecting. At least, that's
+	  // OK provided the dev and namespace are not set. If dev/namespace _are_ set then we
+	  // need the sub-agents to interpret them correctly or not at all.  So that's how
+	  // we end up here, using the old syntax if it's just ip and port, but adopting
+	  // the new syntax when we need to express ip/port/dev/ns.
+	  SFLAddress_print(&collector->ipAddr, ipbuf, 63);
+	  if(collector->deviceName == NULL
+	     && collector->namespace == NULL) {
+	    // old syntax:  collector=IP or collector=IP PORT
+	    if(collector->udpPort == SFL_DEFAULT_COLLECTOR_PORT)
+	      snprintf(collectorStr, HSP_MAX_LINELEN, "collector=%s\n", ipbuf);
+	    else
+	      snprintf(collectorStr, HSP_MAX_LINELEN, "collector=%s %u\n", ipbuf, collector->udpPort);
+	  }
+	  else {
+	    // new syntax: collector=IP/PORT/DEV/NS
+	    snprintf(collectorStr, HSP_MAX_LINELEN, "collector=%s/%u/%s/%s\n",
+		    ipbuf,
+		    collector->udpPort,
+		    collector->deviceName ?: "",
+		    collector->namespace ?: "");
+	  }
 	  strArrayAdd(iplist, collectorStr);
 	}
       }
@@ -824,8 +850,8 @@ extern "C" {
 	method = "interface_down";
       }
       else {
-	char speedStr[51];
 	if(adaptor->ifSpeed) {
+	  char speedStr[51];
 	  if(printSpeed(adaptor->ifSpeed, speedStr, 50)
 	     && lookupApplicationSettings(settings, NULL, speedStr, &sampling_n, NULL)) {
 	    method = speedStr;
@@ -834,11 +860,24 @@ extern "C" {
 	    // calcuate default sampling rate based on link speed.  This ensures
 	    // that a network switch comes up with manageable defaults even if
 	    // the config file is empty...
-	    sampling_n = adaptor->ifSpeed / HSP_SPEED_SAMPLING_RATIO;
-	    if(sampling_n < HSP_SPEED_SAMPLING_MIN) {
-	      sampling_n = HSP_SPEED_SAMPLING_MIN;
+	    uint32_t bpsRatio = 0;
+	    if(lookupApplicationSettings(settings, NULL, HSP_BPS_RATIO, &bpsRatio, NULL)) {
+	      // sampling.bps_ratio=0 turns off the behavior, falling back on global default
+	      if(bpsRatio > 0) {
+		sampling_n = adaptor->ifSpeed / bpsRatio;
+		if(sampling_n == 0)
+		  sampling_n = 1;
+		method = HSP_BPS_RATIO;
+	      }
 	    }
-	    method = "speed_default";
+	    else {
+	      // use default bpsratio
+	      sampling_n = adaptor->ifSpeed / HSP_SPEED_SAMPLING_RATIO;
+	      if(sampling_n < HSP_SPEED_SAMPLING_MIN) {
+		sampling_n = HSP_SPEED_SAMPLING_MIN;
+	      }
+	      method = "speed_default";
+	    }
 	  }
 	}
       }
@@ -1073,48 +1112,93 @@ extern "C" {
   }
 
 
-  static bool priorityHigher(HSP *sp, HSPLocalIP *localIP, HSPLocalIP *challenger, char *dev) {
+/*________________---------------------------__________________
+  ________________  setAddressPriorities     __________________
+  ----------------___________________________------------------
+*/
+
+  static void setAddressPriorities(HSP *sp, UTHash *addrHT) {
+    myDebug(2, "setAddressPriorities");
+    if(addrHT) {
+      HSPLocalIP *lip;
+      UTHASH_WALK(addrHT, lip) {
+	lip->ipPriority = 0;
+	lip->minIfIndex = 0xFFFFFFFF;
+	lip->minSelectionPriority = 0xFFFFFFFF;
+	for(uint32_t ii=0; ii<strArrayN(lip->devs); ii++) {
+	  char *dev = strArrayAt(lip->devs, ii);
+	  SFLAdaptor *adaptor = adaptorByName(sp, dev);
+	  if(adaptor) {
+	    HSPAdaptorNIO *adaptorNIO = ADAPTOR_NIO(adaptor);
+	    if(adaptorNIO) {
+	      uint32_t priority = agentAddressPriority(sp,
+						       &lip->ipAddr,
+						       adaptorNIO->vlan,
+						       adaptorNIO->loopback);
+	      // remember the highest priority score (and which dev it was)
+	      if(priority > lip->ipPriority) {
+		lip->ipPriority = priority;
+		lip->priorityDev = ii;
+	      }
+	      // for SONiC tie-breaker: lowest non-zero selectionPriority seen
+	      if(adaptorNIO->selectionPriority
+		 && adaptorNIO->selectionPriority < lip->minSelectionPriority)
+		lip->minSelectionPriority = adaptorNIO->selectionPriority;
+	      // for tie-breaker: lowest ifIndex seen
+	      if(adaptor->ifIndex < lip->minIfIndex)
+		lip->minIfIndex = adaptor->ifIndex;
+
+	      char ipbuf[51];
+	      myDebug(2, "setAddressPriorities: ip=%s discoveryIdx=%u dev=%s priority=%u minIfIndex=%u minSONiCPriority=%u",
+		      SFLAddress_print(&lip->ipAddr, ipbuf, 50),
+		      lip->discoveryIndex,
+		      dev,
+		      lip->ipPriority,
+		      lip->minIfIndex,
+		      lip->minSelectionPriority);
+	    }
+	  }
+	}
+      }
+    }
+  }
+
+  /*_________________---------------------------__________________
+    _________________      priorityHigher       __________________
+    -----------------___________________________------------------
+  */
+
+  static bool priorityHigher(HSP *sp, HSPLocalIP *localIP, HSPLocalIP *challenger, char *peggedDev) {
     if(localIP == NULL)
       return YES;
     int pri_local = localIP->ipPriority;
     int pri_challenge = challenger->ipPriority;
-    if(dev) {
-      if(my_strequal(dev, challenger->dev))
+    if(peggedDev) {
+      char ipbuf[51];
+      if(strArrayContains(challenger->devs, peggedDev)) {
 	pri_challenge += IPSP_NUM_PRIORITIES;
-      if(my_strequal(dev, localIP->dev))
+	myDebug(2, "%s boosted (dev=%s)", SFLAddress_print(&challenger->ipAddr, ipbuf, 50), peggedDev);
+      }
+      if(strArrayContains(localIP->devs, peggedDev)) {
 	pri_local += IPSP_NUM_PRIORITIES;
+	myDebug(2, "%s boosted (dev=%s)", SFLAddress_print(&localIP->ipAddr, ipbuf, 50), peggedDev);
+      }
     }
     if(pri_challenge < pri_local)
       return NO;
     if(pri_challenge > pri_local)
       return YES;
-    SFLAdaptor *adaptor1 = adaptorByName(sp, localIP->dev);
-    if(adaptor1 == NULL)
-      return YES;
-    SFLAdaptor *adaptor2 = adaptorByName(sp, challenger->dev);
-    if(adaptor2 == NULL)
-      return NO;
-    // if these addresses are on the same interface, take the one we found first
-    if(adaptor1->ifIndex == adaptor2->ifIndex)
-      return (challenger->discoveryIndex < localIP->discoveryIndex);
-    // do we have selection priority numbers? (e.g. in SONiC the Linux
-    // ifIndex numbers can reorder on a warm boot, so priority numbers
-    // are supplied to adaptors to help stabilize this selection).
-    HSPAdaptorNIO *adaptorNIO1 = ADAPTOR_NIO(adaptor1);
-    HSPAdaptorNIO *adaptorNIO2 = ADAPTOR_NIO(adaptor2);
-    uint32_t priority1 = 0xFFFFFFFF;
-    uint32_t priority2 = 0xFFFFFFFF;
-    if(adaptorNIO1)
-      priority1 = adaptorNIO1->selectionPriority;
-    if(adaptorNIO2)
-      priority2 = adaptorNIO2->selectionPriority;
-    if(priority1 != priority2) {
-      // At least one of these was given a selectionPriority
-      return (priority2 < priority1); // lower number wins
-    }
-    // otherwise take the one whose interface has the lower ifIndex
-    return (adaptor2->ifIndex > 0
-	    && adaptor2->ifIndex < adaptor1->ifIndex);
+
+    // tiebreaker (1) : lower SONiC selectionPriority wins
+    if(challenger->minSelectionPriority != localIP->minSelectionPriority)
+      return (challenger->minSelectionPriority < localIP->minSelectionPriority);
+
+    // tiebreaker (2) : lower ifIndex wins
+    if(challenger->minIfIndex != localIP->minIfIndex)
+      return (challenger->minIfIndex < localIP->minIfIndex);
+
+    // tiebreaker (3) : discovered first wins
+    return (challenger->discoveryIndex < localIP->discoveryIndex);
   }
 
   /*_________________---------------------------__________________
@@ -1122,7 +1206,7 @@ extern "C" {
     -----------------___________________________------------------
   */
 
-  bool selectAgentAddress(HSP *sp, int *p_changed) {
+  bool selectAgentAddress(HSP *sp, bool *p_changed, bool *p_mismatch) {
 
     SFLAddress *ip = NULL;
     HSPSFlowSettings *st = sp->sFlowSettings;
@@ -1130,6 +1214,10 @@ extern "C" {
     SFLAdaptor *selectedAdaptor = NULL;
 
     myDebug(1, "selectAgentAddress");
+    
+    // set base priority (and tiebreaker) info for all known local addresses
+    setAddressPriorities(sp, sp->localIP);
+    setAddressPriorities(sp, sp->localIP6);
 
     // see if config specifies ip or adaptor
     if(st
@@ -1146,17 +1234,27 @@ extern "C" {
     }
     else if(st
 	    && st->agentDevice) {
-      myDebug(1, "selectAgentAddress pegged to device in current settings");
+      myDebug(1, "selectAgentAddress pegged to device %s in current settings", st->agentDevice);
       selectedAdaptor = adaptorByName(sp, st->agentDevice);
       if(selectedAdaptor == NULL)
 	selectedAdaptor = adaptorByAlias(sp, st->agentDevice);
+      if(selectedAdaptor == NULL
+	 && p_mismatch) {
+	myDebug(1, "device name mismatch");
+	*p_mismatch = YES;
+      }
     }
     else if(st_file
 	    && st_file->agentDevice) {
-      myDebug(1, "selectAgentAddress pegged to device in config file");
+      myDebug(1, "selectAgentAddress pegged to device %s in config file", st_file->agentDevice);
       selectedAdaptor = adaptorByName(sp, st_file->agentDevice);
       if(selectedAdaptor == NULL)
 	selectedAdaptor = adaptorByAlias(sp, st_file->agentDevice);
+      if(selectedAdaptor == NULL
+	 && p_mismatch) {
+	myDebug(1, "device name mismatch");
+	*p_mismatch = YES;
+      }
     }
     
     if(ip == NULL) {
@@ -1164,18 +1262,25 @@ extern "C" {
       char *peggedDev = selectedAdaptor ? selectedAdaptor->deviceName : NULL;
       HSPLocalIP *selectedLocalIP = NULL;
       HSPLocalIP *lip;
+      char ipbuf[51];
       UTHASH_WALK(sp->localIP, lip) {
-	if(priorityHigher(sp, selectedLocalIP, lip, peggedDev))
+	if(priorityHigher(sp, selectedLocalIP, lip, peggedDev)) {
+	  myDebug(2, "%s preferred", SFLAddress_print(&lip->ipAddr, ipbuf, 50));
 	  selectedLocalIP = lip;
+	}
       }
       UTHASH_WALK(sp->localIP6, lip) {
-	if(priorityHigher(sp, selectedLocalIP, lip, peggedDev))
+	if(priorityHigher(sp, selectedLocalIP, lip, peggedDev)) {
+	  myDebug(2, "%s preferred", SFLAddress_print(&lip->ipAddr, ipbuf, 50));
 	  selectedLocalIP = lip;
+	}
       }
       if(selectedLocalIP) {
 	// picked one.  Fill in ip and adaptor
 	ip = &selectedLocalIP->ipAddr;
-	selectedAdaptor = adaptorByName(sp, selectedLocalIP->dev);
+	char *selectedDev = strArrayAt(selectedLocalIP->devs, selectedLocalIP->priorityDev);
+	if(selectedDev)
+	  selectedAdaptor = adaptorByName(sp, selectedDev);
       }
     }
 
@@ -1320,6 +1425,11 @@ extern "C" {
 	    sp->containerd.containerd = YES;
 	    level[++depth] = HSPOBJ_CONTAINERD;
 	    break;
+	  case HSPTOKEN_K8S:
+	    if((tok = expectToken(sp, tok, HSPTOKEN_STARTOBJ)) == NULL) return NO;
+	    sp->k8s.k8s = YES;
+	    level[++depth] = HSPOBJ_K8S;
+	    break;
 	  case HSPTOKEN_ULOG:
 	    if((tok = expectToken(sp, tok, HSPTOKEN_STARTOBJ)) == NULL) return NO;
 	    sp->ulog.ulog = YES;
@@ -1342,10 +1452,15 @@ extern "C" {
 	    if((tok = expectToken(sp, tok, HSPTOKEN_STARTOBJ)) == NULL) return NO;
 	    sp->dropmon.dropmon = YES;
 	    sp->dropmon.start = YES;
-	    sp->dropmon.limit = 100;
-	    sp->dropmon.max = 100000;
+	    sp->dropmon.limit = HSP_DEFAULT_DROPLIMIT;
+	    sp->dropmon.max = HSP_DEFAULT_DROPTRAP_MAX;
 	    sp->dropmon.sw = YES;
 	    sp->dropmon.hw = YES;
+	    sp->dropmon.rn = YES;
+	    sp->dropmon.hw_unknown = NO;
+	    sp->dropmon.hw_function = NO;
+	    sp->dropmon.sw_passive = NO;
+	    sp->dropmon.hw_passive = NO;
 	    level[++depth] = HSPOBJ_DROPMON;
 	    break;
 	  case HSPTOKEN_PCAP:
@@ -1398,6 +1513,8 @@ extern "C" {
 	    if((tok = expectToken(sp, tok, HSPTOKEN_STARTOBJ)) == NULL) return NO;
 	    sp->sonic.sonic = YES;
 	    sp->sonic.unixsock = YES;
+	    sp->sonic.waitReady = HSP_SONIC_DEFAULT_WAITREADY_SECS;
+	    sp->sonic.suppressOther = YES;
 	    level[++depth] = HSPOBJ_SONIC;
 	    break;
 	  case HSPTOKEN_DBUS:
@@ -1414,6 +1531,18 @@ extern "C" {
 	    if((tok = expectToken(sp, tok, HSPTOKEN_STARTOBJ)) == NULL) return NO;
 	    sp->eapi.eapi = YES;
 	    level[++depth] = HSPOBJ_EAPI;
+	    break;
+	  case HSPTOKEN_NLROUTE:
+	    if((tok = expectToken(sp, tok, HSPTOKEN_STARTOBJ)) == NULL) return NO;
+	    sp->nlroute.nlroute = YES;
+	    sp->nlroute.limit = HSP_DEFAULT_NLROUTE_LIMIT;
+	    level[++depth] = HSPOBJ_NLROUTE;
+	    break;
+	  case HSPTOKEN_VPP:
+	    if((tok = expectToken(sp, tok, HSPTOKEN_STARTOBJ)) == NULL) return NO;
+	    sp->vpp.vpp = YES;
+	    sp->vpp.ifOffset = HSP_DEFAULT_VPP_IFINDEX_OFFSET;
+	    level[++depth] = HSPOBJ_VPP;
 	    break;
 	  case HSPTOKEN_SAMPLING:
 	  case HSPTOKEN_PACKETSAMPLINGRATE:
@@ -1631,6 +1760,23 @@ extern "C" {
 	  }
 	  break;
 
+	case HSPOBJ_K8S:
+	  {
+	    switch(tok->stok) {
+	    case HSPTOKEN_CGROUP_TRAFFIC:
+	      if((tok = expectONOFF(sp, tok, &sp->k8s.markTraffic)) == NULL) return NO;
+	      break;
+	    case HSPTOKEN_EOF:
+	      if((tok = expectONOFF(sp, tok, &sp->k8s.eof)) == NULL) return NO;
+	      break;
+	    default:
+	      unexpectedToken(sp, tok, level[depth]);
+	      return NO;
+	      break;
+	    }
+	  }
+	  break;
+
 	case HSPOBJ_ULOG:
 	  {
 	    switch(tok->stok) {
@@ -1693,7 +1839,12 @@ extern "C" {
 	  {
 	    switch(tok->stok) {
 	    case HSPTOKEN_GROUP:
-	      // deprecated, ignored
+	      // deprecated, ignore as long as it is well-formed. Must still
+	      // parse to consume the arg.
+	      {
+		uint32_t ignore;
+		if((tok = expectInteger32(sp, tok, &ignore, 1, 0xFFFFFFFF)) == NULL) return NO;
+	      }
 	      break;
 	    case HSPTOKEN_START:
 	      if((tok = expectONOFF(sp, tok, &sp->dropmon.start)) == NULL) return NO;
@@ -1703,6 +1854,28 @@ extern "C" {
 	      break;
 	    case HSPTOKEN_HW:
 	      if((tok = expectONOFF(sp, tok, &sp->dropmon.hw)) == NULL) return NO;
+	      break;
+	    case HSPTOKEN_RN:
+	      if((tok = expectONOFF(sp, tok, &sp->dropmon.rn)) == NULL) return NO;
+	      break;
+	    case HSPTOKEN_HW_UNKNOWN:
+	      if((tok = expectONOFF(sp, tok, &sp->dropmon.hw_unknown)) == NULL) return NO;
+	      break;
+	    case HSPTOKEN_HW_FUNCTION: {
+	      // deprecated but still parse to consume cleanly if well-formed */
+	      bool ignore;
+	      if((tok = expectONOFF(sp, tok, &ignore)) == NULL) return NO;
+	    }
+	      break;
+	    case HSPTOKEN_SW_PASSIVE:
+	      if((tok = expectONOFF(sp, tok, &sp->dropmon.sw_passive)) == NULL) return NO;
+	      break;
+	    case HSPTOKEN_HW_PASSIVE:
+	      if((tok = expectONOFF(sp, tok, &sp->dropmon.hw_passive)) == NULL) return NO;
+	      break;
+	    case HSPTOKEN_HIDE:
+	      if((tok = expectRegex(sp, tok, &sp->dropmon.hide_regex)) == NULL) return NO;
+	      sp->dropmon.hide_regex_str = my_strdup(tok->str);
 	      break;
 	    case HSPTOKEN_LIMIT:
 	      if((tok = expectInteger32(sp, tok, &sp->dropmon.limit, 1, HSP_MAX_NOTIFY_RATELIMIT)) == NULL) return NO;
@@ -1736,6 +1909,10 @@ extern "C" {
 	      if((tok = expectIntegerRange64(sp, tok, &pc->speed_min, &pc->speed_max, 0, LLONG_MAX)) == NULL) return NO;
 	      pc->speed_set = YES;
 	      break;
+	    case HSPTOKEN_SAMPLING:
+	      if((tok = expectInteger32(sp, tok, &pc->sampling_n, 0, HSP_MAX_SAMPLING_N)) == NULL) return NO;
+	      pc->sampling_n_set = YES;
+	      break;
 	    default:
 	      unexpectedToken(sp, tok, level[depth]);
 	      return NO;
@@ -1749,6 +1926,12 @@ extern "C" {
 	    switch(tok->stok) {
 	    case HSPTOKEN_TUNNEL:
 	      if((tok = expectONOFF(sp, tok, &sp->tcp.tunnel)) == NULL) return NO;
+	      break;
+	    case HSPTOKEN_UDP:
+	      if((tok = expectONOFF(sp, tok, &sp->tcp.udp)) == NULL) return NO;
+	      break;
+	    case HSPTOKEN_DUMP:
+	      if((tok = expectONOFF(sp, tok, &sp->tcp.dump)) == NULL) return NO;
 	      break;
 	    default:
 	      unexpectedToken(sp, tok, level[depth]);
@@ -1857,6 +2040,15 @@ extern "C" {
 	    case HSPTOKEN_UNIXSOCK:
 	      if((tok = expectONOFF(sp, tok, &sp->sonic.unixsock)) == NULL) return NO;
 	      break;
+	    case HSPTOKEN_DBCONFIG:
+	      if((tok = expectString(sp, tok, &sp->sonic.dbconfig, "path")) == NULL) return NO;
+	      break;
+	    case HSPTOKEN_WAITREADY:
+	      if((tok = expectInteger32(sp, tok, &sp->sonic.waitReady, 0, 0xFFFFFFFF)) == NULL) return NO;
+	      break;
+	    case HSPTOKEN_SUPPRESSOTHER:
+	      if((tok = expectONOFF(sp, tok, &sp->sonic.suppressOther)) == NULL) return NO;
+	      break;
 	    default:
 	      unexpectedToken(sp, tok, level[depth]);
 	      return NO;
@@ -1940,6 +2132,34 @@ extern "C" {
 	case HSPOBJ_EAPI:
 	  {
 	    switch(tok->stok) {
+	    default:
+	      unexpectedToken(sp, tok, level[depth]);
+	      return NO;
+	      break;
+	    }
+	  }
+	  break;
+
+	case HSPOBJ_NLROUTE:
+	  {
+	    switch(tok->stok) {
+	    case HSPTOKEN_LIMIT:
+	      if((tok = expectInteger32(sp, tok, &sp->nlroute.limit, 0, HSP_MAX_NLROUTE_LIMIT)) == NULL) return NO;
+	      break;
+	    default:
+	      unexpectedToken(sp, tok, level[depth]);
+	      return NO;
+	      break;
+	    }
+	  }
+	  break;
+
+	case HSPOBJ_VPP:
+	  {
+	    switch(tok->stok) {
+	    case HSPTOKEN_IFOFFSET:
+	      if((tok = expectInteger32(sp, tok, &sp->vpp.ifOffset, 0, 0xFFFFFFFF)) == NULL) return NO;
+	      break;
 	    default:
 	      unexpectedToken(sp, tok, level[depth]);
 	      return NO;
@@ -2096,6 +2316,17 @@ extern "C" {
 	    myLog(LOG_ERR, "CIDR parse error in dynamic config record <%s>=<%s>", keyBuf, valBuf);
 	  }
 	}
+	else if(!strcasecmp(keyBuf, "dropLimit")) {
+	  st->dropLimit = strtol(valBuf, NULL, 0);
+	  st->dropLimit_set = YES;
+	}
+	else if(tokenMatch(keyBuf, HSPTOKEN_HEADERBYTES)) {
+	  st->headerBytes = strtol(valBuf, NULL, 0);
+	  if(st->headerBytes > HSP_MAX_HEADER_BYTES)
+	    st->headerBytes = HSP_MAX_HEADER_BYTES;
+	}
+	// TODO: *** add datagramBytes, samplingDirection here
+	// so they can be overridden dynamically by DNSSD, SONiC etc.
 	else {
 	  myLog(LOG_INFO, "unexpected dynamic config record <%s>=<%s>", keyBuf, valBuf);
 	}

@@ -44,10 +44,11 @@ extern "C" {
   typedef struct _EVMod {
     EVRoot *root;
     char *name;
-    int id;
+    uint32_t id;
     void *libHandle;
     void (*initFn)(struct _EVMod *);
     void *data;
+    int debugLevel;
   } EVMod;
 
 #define EVROOTDATA(m) (m)->root->rootModule->data
@@ -72,6 +73,7 @@ extern "C" {
     int select_mS;
 #define EVBUS_SELECT_MS_TICK 599
 #define EVBUS_SELECT_MS_DECI 59
+    struct timespec tstart;
     struct timespec now;
     struct timespec now_tick;
     struct timespec now_deci;
@@ -173,13 +175,15 @@ extern "C" {
   void EVTimeAdd_nS(struct timespec *t, int nS);
   void EVBusRunThread(EVBus *bus, size_t stacksize);
   void EVBusRun(EVBus *bus);
+  int EVBusRunningTime_mS(EVBus *bus);
   void EVBusStop(EVBus *bus);
   EVBus *EVCurrentBus(void);
   void EVCurrentBusSet(EVBus *bus);
   void EVRun(EVBus *mainBus);
   void EVStop(EVMod *mod);
   void EVLog(uint32_t rl_secs, int syslogType, char *fmt, ...);
-
+  bool EVDebug(EVMod *mod, int level, char *fmt, ...);
+  
 #if defined(__cplusplus)
 } /* extern "C" */
 #endif

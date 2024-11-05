@@ -44,6 +44,7 @@ extern "C" {
   } EnumKernelTCPState;
 
   char *UTNLDiag_sockid_print(struct inet_diag_sockid *sockid);
+  bool UTNLDiag_sockid_normalize(struct inet_diag_sockid *sockid);
 
   int UTNLDiag_open(void);
 
@@ -57,6 +58,12 @@ extern "C" {
   uint32_t UTNLGeneric_pid(uint32_t mod_id);
 
   int UTNLGeneric_send(int sockfd, uint32_t mod_id, int type, int cmd, int req_type, void *req, int req_len, uint32_t seqNo);
+
+  int UTNLRoute_open(uint32_t mod_id, bool nonBlocking, size_t bufferSize);
+  int UTNLRoute_send(int sockfd, uint32_t mod_id, uint32_t ifIndex, uint field, uint32_t seqNo);
+  int UTNLRoute_recv(int sockfd, uint field, uint32_t *pIfIndex, char *resultBuf, uint *pResultLen);
+
+  int UTNLUsersock_open(uint32_t mod_id);
 
   // linux/netlink.h defines struct nlattr but doesn't provide the walking macros NLA_OK, NLA_NEXT.
   // rtnetlink.h provides RTA_OK, RTA_NEXT macros.

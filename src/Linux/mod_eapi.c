@@ -107,12 +107,12 @@ Expecting something like:
     if(n_sources_v4) {
       cJSON *source = cJSON_GetArrayItem(sources_v4, 0);
       cJSON *ip = cJSON_GetObjectItem(source, "ipv4Address");
-      gotAgent = parseNumericAddress(ip->valuestring, NULL, &agent, AF_INET);
+      gotAgent = parseNumericAddress(ip->valuestring, NULL, &agent, PF_INET);
     }
     if(n_sources_v6 &&  !gotAgent) {
       cJSON *source = cJSON_GetArrayItem(sources_v6, 0);
       cJSON *ip = cJSON_GetObjectItem(source, "ipv6Address");
-      gotAgent = parseNumericAddress(ip->valuestring, NULL, &agent, AF_INET6);
+      gotAgent = parseNumericAddress(ip->valuestring, NULL, &agent, PF_INET6);
     }
     cJSON *dests_v4 = cJSON_GetObjectItem(sflow, "ipv4Destinations");
     cJSON *dests_v6 = cJSON_GetObjectItem(sflow, "ipv6Destinations");
@@ -176,13 +176,11 @@ Expecting something like:
     -----------------___________________________------------------
   */
 
-  static void logJSON(int debugLevel, char *msg, cJSON *obj)
+  static void logJSON(char *msg, cJSON *obj)
   {
-    if(debug(debugLevel)) {
-      char *str = cJSON_Print(obj);
-      myLog(LOG_INFO, "%s json=<%s>", msg, str);
-      my_free(str); // TODO: get this fn from cJSON hooks
-    }
+    char *str = cJSON_Print(obj);
+    myLog(LOG_INFO, "%s json=<%s>", msg, str);
+    my_free(str); // TODO: get this fn from cJSON hooks
   }
 
   /*_________________---------------------------__________________
@@ -194,7 +192,8 @@ Expecting something like:
     myDebug(3, "processEapiJSON");
     cJSON *top = cJSON_Parse(UTSTRBUF_STR(buf));
     if(top) {
-      logJSON(1, "processEapiJSON:", top);
+      if(EVDebug(mod, 1, NULL))
+	logJSON("processEapiJSON:", top);
       (*req->jsonCB)(mod, buf, top);
       cJSON_Delete(top);
     }

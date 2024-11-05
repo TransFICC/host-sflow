@@ -22,6 +22,8 @@ extern "C" {
 #include <dbus/dbus.h>
 #include <openssl/sha.h>
 #include <dirent.h>
+#include <uuid/uuid.h>
+#include <fnmatch.h>
 
 #include "hsflowd.h"
 #include "cpu_utils.h"
@@ -43,9 +45,6 @@ extern "C" {
 
 #define HSP_DBUS_MONITOR 0
 
-#define HSP_SYSTEMD_CGROUP_PROCS SYSFS_STR "/fs/cgroup/systemd/%s/cgroup.procs"
-#define HSP_SYSTEMD_CGROUP_ACCT SYSFS_STR "/fs/cgroup/%s%s/%s"
-  
   typedef void (*HSPDBusHandler)(EVMod *mod, DBusMessage *dbm, void *magic);
 
   typedef struct _HSPDBusRequest {
@@ -72,7 +71,6 @@ extern "C" {
     bool memoryAccounting:1;
     bool blockIOAccounting:1;
     HSPUnitCounters cntr;
-    uint listenSocksRev;
   } HSPDBusUnit;
 
   typedef struct _HSPDBusProcess {
@@ -85,20 +83,8 @@ extern "C" {
   typedef struct _HSPVMState_SYSTEMD {
     HSPVMState vm; // superclass: must come first
     char *id;
+    uint64_t cgroup_id;
   } HSPVMState_SYSTEMD;
-
-  typedef struct _HSPSapId {
-    // SFLAddress addr;
-    uint16_t port;
-    uint8_t protocol;
-  } HSPSapId;
-    
-  typedef struct _HSPListenSock {
-    HSPSapId sapId;
-    uint32_t inode;
-    HSPDBusUnit *unit;
-    bool marked:1;
-  } HSPListenSock;
 
   typedef struct _HSP_mod_SYSTEMD {
     DBusConnection *connection;
@@ -111,7 +97,7 @@ extern "C" {
     EVBus *packetBus;
     UTHash *vmsByUUID;
     UTHash *vmsByID;
-    UTHash *pollActions;
+    UTHash *vmsByCgroupId;
     SFLCounters_sample_element vnodeElem;
     uint32_t countdownToResync;
     regex_t *service_regex;
@@ -120,15 +106,15 @@ extern "C" {
     bool subscribed;
 #endif
     uint32_t page_size;
-    char *cgroup_procs;
-    char *cgroup_acct;
-    UTHash *listenSocks;
-    UTHash *listenSocksByInode;
-    int nl_sock;
-    uint32_t nextListenSockQuery;
-    uint listenSocksRev;
+    char *cgroup_path;
+    char *cgroup_systemd;
+    char *cgroup_cpuacct;
+    char *cgroup_memory;
+    char *cgroup_blkio;
     uint packetSamples;
   } HSP_mod_SYSTEMD;
+
+  static void getCounters_SYSTEMD(EVMod *mod, HSPVMState_SYSTEMD *container);
 
   /*_________________---------------------------__________________
     _________________     logging utils         __________________
@@ -159,6 +145,60 @@ extern "C" {
       myLog(LOG_INFO, "%s: %s", prefix, containerStr(container, buf, 1024));
   }
 
+  /*________________---------------------------__________________
+    ________________    readCgroupPaths        __________________
+    ----------------___________________________------------------
+  */
+
+  static void readCgroupPaths(EVMod *mod) {
+    HSP_mod_SYSTEMD *mdata = (HSP_mod_SYSTEMD *)mod->data;
+    char mpath[HSP_MAX_PATHLEN+1];
+    snprintf(mpath, HSP_MAX_PATHLEN, PROCFS_STR "/mounts");
+    FILE *procFile = fopen(mpath, "r");
+    if(procFile) {
+      // limit the number of chars we will read from each line
+      // (there can be more than this - my_readline will chop for us)
+      char line[MAX_PROC_LINELEN];
+      int truncated;
+      while(my_readline(procFile, line, MAX_PROC_LINELEN, &truncated) != EOF) {
+	char buf[MAX_PROC_LINELEN];
+	char *p = line;
+	char *fsType = parseNextTok(&p, " ", NO, '\0', NO, buf, MAX_PROC_LINELEN);
+	if(my_strequal(fsType, "cgroup2")) {
+	  char *fsPath = parseNextTok(&p, " ", NO, '\0', NO, buf, MAX_PROC_LINELEN);
+	  if(fsPath) {
+	    EVDebug(mod, 1, "found cgroup2 path = %s", fsPath);
+	    mdata->cgroup_path = my_strdup(fsPath);
+	  }
+	}
+	// cgroups v1 systemd, cpuacct, memory, blkio
+	if(my_strequal(fsType, "cgroup")) {
+	  char *fsPath = parseNextTok(&p, " ", NO, '\0', NO, buf, MAX_PROC_LINELEN);
+	  if(fsPath) {
+	    if(fnmatch("*/systemd", fsPath, 0) == 0) {
+	      EVDebug(mod, 1, "found cgroup v1 systemd controller path = %s", fsPath);
+	      mdata->cgroup_systemd = my_strdup(fsPath);
+	    }
+	    if(fnmatch("*/cpuacct", fsPath, 0) == 0) {
+	      EVDebug(mod, 1, "found cgroup v1 cpuacct controller path = %s", fsPath);
+	      mdata->cgroup_cpuacct = my_strdup(fsPath);
+	    }
+	    if(fnmatch("*/memory", fsPath, 0) == 0) {
+	      EVDebug(mod, 1, "found cgroup v1 memory controller path = %s", fsPath);
+	      mdata->cgroup_memory = my_strdup(fsPath);
+	    }
+	    if(fnmatch("*/blkio", fsPath, 0) == 0) {
+	      EVDebug(mod, 1, "found cgroup v1 blkio controller path = %s", fsPath);
+	      mdata->cgroup_blkio = my_strdup(fsPath);
+	    }
+	  }
+	}
+	
+      }
+      fclose(procFile);
+    }
+  }
+
   /*_________________---------------------------__________________
     _________________   add and remove VM       __________________
     -----------------___________________________------------------
@@ -167,30 +207,37 @@ extern "C" {
   static void agentCB_getCounters_SYSTEMD_request(void *magic, SFLPoller *poller, SFL_COUNTERS_SAMPLE_TYPE *cs)
   {
     EVMod *mod = (EVMod *)magic;
-    HSP_mod_SYSTEMD *mdata = (HSP_mod_SYSTEMD *)mod->data;
     HSPVMState_SYSTEMD *container = (HSPVMState_SYSTEMD *)poller->userData;
-    UTHashAdd(mdata->pollActions, container);
+    getCounters_SYSTEMD(mod, container);
   }
 
   static void removeAndFreeVM_SYSTEMD(EVMod *mod, HSPVMState_SYSTEMD *container) {
     HSP_mod_SYSTEMD *mdata = (HSP_mod_SYSTEMD *)mod->data;
-    if(getDebug()) {
-      myLog(LOG_INFO, "removeAndFreeVM: removing service with dsIndex=%u", container->vm.dsIndex);
-    }
+
+    EVDebug(mod, 1, "removeAndFreeVM: removing service with dsIndex=%u", container->vm.dsIndex);
 
     if(UTHashDel(mdata->vmsByID, container) == NULL) {
       myLog(LOG_ERR, "UTHashDel (vmsByID) failed: service %s", container->id);
-      if(debug(1))
+      if(EVDebug(mod, 1, NULL))
 	containerHTPrint(mdata->vmsByID, "vmsByID");
     }
 
     if(UTHashDel(mdata->vmsByUUID, container) == NULL) {
       myLog(LOG_ERR, "UTHashDel (vmsByUUID) failed: service %s", container->id);
-      if(debug(1))
+      if(EVDebug(mod, 1, NULL))
 	containerHTPrint(mdata->vmsByUUID, "vmsByUUID");
     }
 
-    if(container->id) my_free(container->id);
+    if(container->cgroup_id
+       && UTHashDel(mdata->vmsByCgroupId, container) == NULL) {
+      myLog(LOG_ERR, "UTHashDel (vmsByCgroupId) failed: service %s", container->id);
+      if(EVDebug(mod, 1, NULL))
+	containerHTPrint(mdata->vmsByCgroupId, "vmsByCgroupId");
+    }
+
+    if(container->id)
+      my_free(container->id);
+    
     removeAndFreeVM(mod, &container->vm);
   }
 
@@ -211,6 +258,27 @@ extern "C" {
 	// add to collections
 	UTHashAdd(mdata->vmsByID, container);
 	UTHashAdd(mdata->vmsByUUID, container);
+	// see if we can get a cgroup id (no point if it is not cgroups v2)
+	if(unit->cgroup
+	   && mdata->cgroup_path) {
+	  char fName[HSP_SYSTEMD_MAX_FNAME_LEN+1];
+	  snprintf(fName, HSP_SYSTEMD_MAX_FNAME_LEN, "%s/%s",
+		   mdata->cgroup_path,
+		   unit->cgroup);
+	  struct stat statBuf = {};
+	  if(stat(fName, &statBuf) != 0) {
+	    EVDebug(mod, 1, "cannot get inode for cgroup %s", unit->cgroup);
+	  }
+	  else {
+	    container->cgroup_id = statBuf.st_ino;
+	    EVDebug(mod, 1, "Learned cgroup_id = %u for container %s (%s)",
+		    container->cgroup_id,
+		    container->id,
+		    fName);
+	    // remember this for packet sample lookup
+	    UTHashAdd(mdata->vmsByCgroupId, container);
+	  }
+	}
       }
     }
     return container;
@@ -221,6 +289,7 @@ extern "C" {
     -----------------___________________________------------------
   */
 
+#ifndef UUID_TYPE_DCE_SHA1
   static void uuidgen_type5(HSP *sp, u_char *uuid, char *name) {
     // Generate type 5 UUID (rfc 4122)
     SHA_CTX ctx;
@@ -245,7 +314,20 @@ extern "C" {
     uuid[8] &= 0x3F;
     uuid[8] |= 0x80;
   }
-
+#else
+  static void uuidgen_type5(HSP *sp, u_char *uuid, char *name) {
+    // Generate type 5 UUID (rfc 4122)
+    int len = my_strlen(name);
+    // also hash in agent IP address in case sp->uuid is missing or not unique
+    int addrLen = sp->agentIP.type == SFLADDRESSTYPE_IP_V6 ? 16 : 4;
+    char *buf = (char *)my_calloc(len + addrLen);
+    memcpy(buf, name, len);
+    memcpy(buf + len, &sp->agentIP.address, addrLen);
+    uuid_generate_sha1(uuid, (u_char *)sp->uuid, buf, len + addrLen);
+    my_free(buf);
+  }
+#endif
+  
   /*_________________---------------------------__________________
     _________________    HSPDBusUnit            __________________
     -----------------___________________________------------------
@@ -261,7 +343,6 @@ extern "C" {
   }
 
   static void HSPDBusUnitFree(EVMod *mod, HSPDBusUnit *unit) {
-    HSP_mod_SYSTEMD *mdata = (HSP_mod_SYSTEMD *)mod->data;
     if(unit->name) my_free(unit->name);
     if(unit->obj) my_free(unit->obj);
     if(unit->cgroup) my_free(unit->cgroup);
@@ -269,12 +350,6 @@ extern "C" {
     UTHASH_WALK(unit->processes, process)
       my_free(process);
     UTHashFree(unit->processes);
-    if(mdata->listenSocks) {
-      HSPListenSock *listenSock;
-      UTHASH_WALK(mdata->listenSocks, listenSock)
-	if(listenSock->unit == unit)
-	  listenSock->unit = NULL;
-    }
     my_free(unit);
   }
 
@@ -291,7 +366,7 @@ extern "C" {
     sprintf(path, PROCFS_STR "/%u/stat", process->pid);
     FILE *statFile = fopen(path, "r");
     if(statFile == NULL) {
-      myDebug(2, "cannot open %s : %s", path, strerror(errno));
+      EVDebug(mod, 2, "cannot open %s : %s", path, strerror(errno));
     }
     else {
       char line[MAX_PROC_LINELEN];
@@ -346,7 +421,7 @@ extern "C" {
     sprintf(path, PROCFS_STR "/%u/statm", process->pid);
     FILE *statFile = fopen(path, "r");
     if(statFile == NULL) {
-      myDebug(2, "cannot open %s : %s", path, strerror(errno));
+      EVDebug(mod, 2, "cannot open %s : %s", path, strerror(errno));
     }
     else {
       char line[MAX_PROC_LINELEN];
@@ -394,7 +469,7 @@ extern "C" {
     sprintf(path, PROCFS_STR "/%u/io", process->pid);
     FILE *statFile = fopen(path, "r");
     if(statFile == NULL) {
-      myDebug(2, "cannot open %s : %s", path, strerror(errno));
+      EVDebug(mod, 2, "cannot open %s : %s", path, strerror(errno));
     }
     else {
       found = YES;
@@ -439,90 +514,18 @@ extern "C" {
     return gotData;
   }
 
-  /*________________---------------------------__________________
-    ________________    readProcessFDs         __________________
-    ----------------___________________________------------------
-    build socket_inode->unit while counting FDs
-    TODO: is there not a more efficient way to do this?
-  */
-
-  static uint32_t readProcessFDs(EVMod *mod, HSPDBusUnit *unit, HSPDBusProcess *process, bool mapListenSocks) {
-    HSP_mod_SYSTEMD *mdata = (HSP_mod_SYSTEMD *)mod->data;
-    uint32_t countFDs = 0;
-    char path[HSP_SYSTEMD_MAX_FNAME_LEN];
-    sprintf(path, PROCFS_STR "/%u/fd", process->pid);
-    DIR *dstream = opendir(path);
-    if(dstream) {
-      struct dirent *ptr;
-      while((ptr = readdir(dstream)) != NULL) {
-	if(ptr->d_name[0] != '.') {
-	  countFDs++;
-	  if(mapListenSocks) {
-	    char linkPath[HSP_SYSTEMD_MAX_FNAME_LEN];
-	    if(snprintf(linkPath, HSP_SYSTEMD_MAX_FNAME_LEN, "%s/%s", path, ptr->d_name) > 0) {
-	      char linkStr[HSP_SYSTEMD_MAX_FNAME_LEN];
-	      ssize_t linkStrLen = readlink(linkPath, linkStr, HSP_SYSTEMD_MAX_FNAME_LEN);
-	      if(linkStrLen > 0) {
-		linkStr[linkStrLen]='\0';
-		if(linkStr[linkStrLen-1] == ']'
-		   && strncmp(linkStr, "socket:[", 8) == 0) {
-		  uint32_t ino = atoi(linkStr + 8);
-		  HSPListenSock search = { .inode = ino };
-		  HSPListenSock *listenSock = UTHashGet(mdata->listenSocksByInode, &search);
-		  if(listenSock) {
-		    myDebug(1, "fd link inode = %u", ino);
-		    listenSock->unit = unit;
-		  }
-		}
-	      }
-	    }
-	  }
-	}
-      }
-      closedir(dstream);
-    }
-    return countFDs;
-  }
-
-  /*________________---------------------------__________________
-    ________________ accumulateFileDescriptors __________________
-    ----------------___________________________------------------
-  */
-
-  static uint32_t accumulateFileDescriptors(EVMod *mod, HSPDBusUnit *unit, uint32_t *pMaxByProcess) {
-    HSP_mod_SYSTEMD *mdata = (HSP_mod_SYSTEMD *)mod->data;
-    // re-map the sockets for these processes if there was any change at all
-    // to the listenSocks hash table since the last time we were here.
-    bool mapListenSocks = mdata->listenSocks && (mdata->listenSocksRev != unit->listenSocksRev);
-    HSPDBusProcess *process;
-    uint32_t unitFDs = 0;
-    uint32_t maxProcessFDs = 0;
-    UTHASH_WALK(unit->processes, process) {
-      uint32_t processFDs = readProcessFDs(mod, unit, process, mapListenSocks);
-      unitFDs += processFDs;
-      if(processFDs > maxProcessFDs)
-	maxProcessFDs = processFDs;
-    }
-    if(pMaxByProcess)
-      *pMaxByProcess = maxProcessFDs;
-    if(mapListenSocks)
-      unit->listenSocksRev = mdata->listenSocksRev;
-    return unitFDs;
-  }
-
   /*_________________---------------------------__________________
     _________________     readCgroupCounters    __________________
     -----------------___________________________------------------
   */
 
-  static bool readCgroupCounters(EVMod *mod, char *acct, char *cgroup, char *fname, int nvals, HSPNameVal *nameVals, bool multi) {
-    HSP_mod_SYSTEMD *mdata = (HSP_mod_SYSTEMD *)mod->data;
+  static bool readCgroupCounters(EVMod *mod, char *ctrlPath, char *cgroup, char *fname, int nvals, HSPNameVal *nameVals, bool multi) {
     int found = 0;
     char statsFileName[HSP_SYSTEMD_MAX_FNAME_LEN+1];
-    snprintf(statsFileName, HSP_SYSTEMD_MAX_FNAME_LEN, mdata->cgroup_acct, acct, cgroup, fname);
+    snprintf(statsFileName, HSP_SYSTEMD_MAX_FNAME_LEN, "%s/%s/%s", ctrlPath, cgroup, fname);
     FILE *statsFile = fopen(statsFileName, "r");
     if(statsFile == NULL) {
-      myDebug(2, "cannot open %s : %s", statsFileName, strerror(errno));
+      EVDebug(mod, 2, "cannot open %s : %s", statsFileName, strerror(errno));
     }
     else {
       char line[HSP_SYSTEMD_MAX_STATS_LINELEN];
@@ -531,6 +534,75 @@ extern "C" {
       char *fmt = multi ?
 	"%*s %s %"SCNu64 :
 	"%s %"SCNu64 ;
+      int truncated;
+      while(my_readline(statsFile, line, HSP_SYSTEMD_MAX_STATS_LINELEN, &truncated) != EOF) {
+	if(found == nvals && !multi) break;
+	if(sscanf(line, fmt, var, &val64) == 2) {
+	  for(int ii = 0; ii < nvals; ii++) {
+	    char *nm = nameVals[ii].nv_name;
+	    if(nm == NULL) break; // null name is double-check
+	    if(strcmp(var, nm) == 0)  {
+	      nameVals[ii].nv_found = YES;
+	      nameVals[ii].nv_val64 += val64;
+	      found++;
+	    }
+	  }
+        }
+      }
+      fclose(statsFile);
+    }
+    return (found > 0);
+  }
+
+  /*_________________---------------------------__________________
+    _________________     readCgroup2Counters   __________________
+    -----------------___________________________------------------
+  */
+
+  static bool readCgroup2Counter(EVMod *mod, char *cgroup, char *fname, uint64_t *pVal64) {
+    HSP_mod_SYSTEMD *mdata = (HSP_mod_SYSTEMD *)mod->data;
+    bool ok = NO;
+    char statsFileName[HSP_SYSTEMD_MAX_FNAME_LEN+1];
+    snprintf(statsFileName, HSP_SYSTEMD_MAX_FNAME_LEN, "%s/%s/%s",
+	     mdata->cgroup_path,
+	     cgroup,
+	     fname);
+    FILE *statsFile = fopen(statsFileName, "r");
+    if(statsFile == NULL) {
+      EVDebug(mod, 2, "cannot open %s : %s", statsFileName, strerror(errno));
+    }
+    else {
+      char line[HSP_SYSTEMD_MAX_STATS_LINELEN];
+      int truncated;
+      if(my_readline(statsFile, line, HSP_SYSTEMD_MAX_STATS_LINELEN, &truncated) != EOF) {
+	if(sscanf(line, "%"SCNu64, pVal64) == 1) {
+	  ok = YES;
+        }
+      }
+      fclose(statsFile);
+    }
+    return ok;
+  }
+
+  static bool readCgroup2Counters(EVMod *mod, char *cgroup, char *fname, int nvals, HSPNameVal *nameVals, bool multi) {
+    HSP_mod_SYSTEMD *mdata = (HSP_mod_SYSTEMD *)mod->data;
+    int found = 0;
+    char statsFileName[HSP_SYSTEMD_MAX_FNAME_LEN+1];
+    snprintf(statsFileName, HSP_SYSTEMD_MAX_FNAME_LEN, "%s/%s/%s",
+	     mdata->cgroup_path,
+	     cgroup,
+	     fname);
+    FILE *statsFile = fopen(statsFileName, "r");
+    if(statsFile == NULL) {
+      EVDebug(mod, 2, "cannot open %s : %s", statsFileName, strerror(errno));
+    }
+    else {
+      char line[HSP_SYSTEMD_MAX_STATS_LINELEN];
+      char var[HSP_SYSTEMD_MAX_STATS_LINELEN];
+      uint64_t val64;
+      char *fmt = multi ?
+	"%s %"SCNu64 :
+	"%"SCNu64 ;
       int truncated;
       while(my_readline(statsFile, line, HSP_SYSTEMD_MAX_STATS_LINELEN, &truncated) != EOF) {
 	if(found == nvals && !multi) break;
@@ -614,53 +686,83 @@ extern "C" {
     cpuElem.counterBlock.host_vrt_cpu.state = virState;
 
     uint64_t cpu_total = 0;
-    if(unit->cpuAccounting) {
+    if(mdata->cgroup_path) {
+      HSPNameVal cpuVals[] = {
+	{ "usage_usec",0,0 },
+	{ "user_usec",0,0},
+	{ "system_usec",0,0},
+	{ NULL,0,0},
+      };
+      if(readCgroup2Counters(mod, unit->cgroup, "cpu.stat", 3, cpuVals, YES)) {
+	if(cpuVals[0].nv_found)
+	  cpu_total = cpuVals[0].nv_val64;
+	// sFlow VM CPU not broken out by user/system
+      }
+      cpuElem.counterBlock.host_vrt_cpu.cpuTime = (uint32_t)(cpu_total / 1000); // uS to mS
+    }
+
+    // Fallback 1 - try groups v1 cpu accounting
+    if(cpu_total == 0
+       && unit->cpuAccounting
+       && mdata->cgroup_cpuacct) {
       HSPNameVal cpuVals[] = {
 	{ "user",0,0 },
 	{ "system",0,0},
 	{ NULL,0,0},
       };
-      if(readCgroupCounters(mod, "cpuacct", unit->cgroup, "cpuacct.stat", 2, cpuVals, NO)) {
+      if(readCgroupCounters(mod, mdata->cgroup_cpuacct, unit->cgroup, "cpuacct.stat", 2, cpuVals, NO)) {
 	if(cpuVals[0].nv_found) cpu_total += cpuVals[0].nv_val64;
 	if(cpuVals[1].nv_found) cpu_total += cpuVals[1].nv_val64;
       }
+      cpuElem.counterBlock.host_vrt_cpu.cpuTime = (uint32_t)(JIFFY_TO_MS(cpu_total));
     }
+ 
+    // Fallback 2 - add up by process
     if(cpu_total == 0) {
       cpu_total = accumulateProcessCPU(mod, unit);
+      cpuElem.counterBlock.host_vrt_cpu.cpuTime = (uint32_t)(JIFFY_TO_MS(cpu_total));
     }
-    cpuElem.counterBlock.host_vrt_cpu.cpuTime = (uint32_t)(JIFFY_TO_MS(cpu_total));
     SFLADD_ELEMENT(&cs, &cpuElem);
 
     SFLCounters_sample_element memElem = { 0 };
     memElem.tag = SFLCOUNTERS_HOST_VRT_MEM;
     uint64_t rss = 0;
-    if(unit->memoryAccounting) {
+    uint64_t rss_max = 0;
+    if(mdata->cgroup_path) {
+      readCgroup2Counter(mod, unit->cgroup, "memory.current", &rss);
+      readCgroup2Counter(mod, unit->cgroup, "memory.max", &rss_max);
+    }
+    // Fallback 1 - try cgroups v1 accounting
+    if(rss == 0
+       && unit->memoryAccounting
+       && mdata->cgroup_memory) {
       HSPNameVal memVals[] = {
 	{ "rss",0,0 },
 	{ NULL,0,0},
       };
-      if(readCgroupCounters(mod, "memory", unit->cgroup, "memory.stat", 2, memVals, NO)) {
+      if(readCgroupCounters(mod, mdata->cgroup_memory, unit->cgroup, "memory.stat", 2, memVals, NO)) {
 	if(memVals[0].nv_found) rss += memVals[0].nv_val64;
       }
     }
+    // Fallback 2 - add up by process
     if(rss == 0) {
       rss = accumulateProcessRAM(mod, unit);
     }
     memElem.counterBlock.host_vrt_mem.memory = rss;
-    // TODO: get max memory (from DBUS? from /proc/<pid>/oom?)
-    // memElem.counterBlock.host_vrt_mem.maxMemory = maxMem;
+    memElem.counterBlock.host_vrt_mem.maxMemory = rss_max ?: sp->mem_total;
     SFLADD_ELEMENT(&cs, &memElem);
 
     // VM disk I/O counters
     SFLCounters_sample_element dskElem = { 0 };
     dskElem.tag = SFLCOUNTERS_HOST_VRT_DSK;
-    if(unit->blockIOAccounting) {
+    if(unit->blockIOAccounting
+       && mdata->cgroup_blkio) {
       HSPNameVal dskValsB[] = {
 	{ "Read",0,0 },
 	{ "Write",0,0},
 	{ NULL,0,0},
       };
-      if(readCgroupCounters(mod, "blkio", unit->cgroup, "blkio.io_service_bytes_recursive", 2, dskValsB, YES)) {
+      if(readCgroupCounters(mod, mdata->cgroup_blkio, unit->cgroup, "blkio.io_service_bytes_recursive", 2, dskValsB, YES)) {
 	if(dskValsB[0].nv_found) {
 	  dskElem.counterBlock.host_vrt_dsk.rd_bytes += dskValsB[0].nv_val64;
 	}
@@ -675,7 +777,7 @@ extern "C" {
 	{ NULL,0,0},
       };
 
-      if(readCgroupCounters(mod, "blkio", unit->cgroup, "blkio.io_serviced_recursive", 2, dskValsO, YES)) {
+      if(readCgroupCounters(mod, mdata->cgroup_blkio, unit->cgroup, "blkio.io_serviced_recursive", 2, dskValsO, YES)) {
 	if(dskValsO[0].nv_found) {
 	  dskElem.counterBlock.host_vrt_dsk.rd_req += dskValsO[0].nv_val64;
 	}
@@ -693,23 +795,9 @@ extern "C" {
     // TODO: can we fill in capacity, allocation and available?
     SFLADD_ELEMENT(&cs, &dskElem);
 
-    // count file-descriptors and build inode->unit here. That way
-    // the fd-counter is correct, but it also has the effect of
-    // smoothing the /proc walks out over the polling interval
-    uint32_t maxProcessFDs = 0;
-    accumulateFileDescriptors(mod, unit, &maxProcessFDs);
-    // TODO: add fd count to new structure (or append to existing one)
-    // it could be a total for the vm/container as well as a max for any
-    // one process.  I guess it could also tally files, sockets etc.
-    // separately,  but the main reason for doing this is to detect when
-    // the ulimit might soon be reached. Running out of file-descriptors
-    // is such a classic meltdown scenario...
-
-    SEMLOCK_DO(sp->sync_agent) {
-      sfl_poller_writeCountersSample(vm->poller, &cs);
-      sp->counterSampleQueued = YES;
-      sp->telemetry[HSP_TELEMETRY_COUNTER_SAMPLES]++;
-    }
+    sfl_poller_writeCountersSample(vm->poller, &cs);
+    sp->counterSampleQueued = YES;
+    sp->telemetry[HSP_TELEMETRY_COUNTER_SAMPLES]++;
   }
 
   /*_________________---------------------------__________________
@@ -744,7 +832,7 @@ extern "C" {
       log_dbus_error(mod, "dbus_connection_send");
     }
     else {
-      myDebug(1, "SYSTEMD dbus method %s serial=%u", method, serial);
+      EVDebug(mod, 1, "SYSTEMD dbus method %s serial=%u", method, serial);
       // register the handler
       HSPDBusRequest *req = (HSPDBusRequest *)my_calloc(sizeof(HSPDBusRequest));
       req->serial = serial;
@@ -830,7 +918,7 @@ extern "C" {
     if(dbus_message_iter_init(dbm, &it)) {
       MyDBusBasicValue val;
       if(db_get(&it, DBUS_TYPE_BOOLEAN, &val)) {
-	myDebug(1, "UNIT CPUAccounting %u", val.bool_val);
+	EVDebug(mod, 1, "UNIT CPUAccounting %u", val.bool_val);
 	unit->cpuAccounting = val.bool_val;
       }
     }
@@ -842,7 +930,7 @@ extern "C" {
     if(dbus_message_iter_init(dbm, &it)) {
       MyDBusBasicValue val;
       if(db_get(&it, DBUS_TYPE_BOOLEAN, &val)) {
-	myDebug(1, "UNIT memoryAccounting %u", val.bool_val);
+	EVDebug(mod, 1, "UNIT memoryAccounting %u", val.bool_val);
 	unit->memoryAccounting = val.bool_val;
       }
     }
@@ -854,7 +942,7 @@ extern "C" {
     if(dbus_message_iter_init(dbm, &it)) {
       MyDBusBasicValue val;
       if(db_get(&it, DBUS_TYPE_BOOLEAN, &val)) {
-	myDebug(1, "UNIT BlockIOAccounting %u", val.bool_val);
+	EVDebug(mod, 1, "UNIT BlockIOAccounting %u", val.bool_val);
 	unit->blockIOAccounting = val.bool_val;
       }
     }
@@ -875,7 +963,7 @@ extern "C" {
 	 && val.str
 	 && my_strlen(val.str)
 	 && regexec(mdata->system_slice_regex, val.str, 0, NULL, 0) == 0) {
-	myDebug(1, "UNIT CGROUP[cgroup=\"%s\"]", val.str);
+	EVDebug(mod, 1, "UNIT CGROUP[cgroup=\"%s\"]", val.str);
 	if(unit->cgroup
 	   && !my_strequal(unit->cgroup, val.str)) {
 	  // cgroup name changed
@@ -893,10 +981,13 @@ extern "C" {
 	  process->marked = YES;
 
 	char path[HSP_SYSTEMD_MAX_FNAME_LEN+1];
-	sprintf(path, mdata->cgroup_procs, val.str);
+	char *systemd_controller = mdata->cgroup_path ?: mdata->cgroup_systemd;
+	snprintf(path, HSP_SYSTEMD_MAX_FNAME_LEN, "%s/%s/cgroup.procs",
+		 systemd_controller,
+		 unit->cgroup);
 	FILE *pidsFile = fopen(path, "r");
 	if(pidsFile == NULL) {
-	  myDebug(2, "cannot open %s : %s", path, strerror(errno));
+	  EVDebug(mod, 2, "cannot open %s : %s", path, strerror(errno));
 	}
 	else {
 	  char line[MAX_PROC_LINELEN];
@@ -904,7 +995,7 @@ extern "C" {
 	  int truncated;
 	  while(my_readline(pidsFile, line, MAX_PROC_LINELEN, &truncated) != EOF) {
 	    if(sscanf(line, "%"SCNu64, &pid64) == 1) {
-	      myDebug(1, "got PID=%"PRIu64, pid64);
+	      EVDebug(mod, 1, "got PID=%"PRIu64, pid64);
 	      HSPDBusProcess search = { .pid = pid64 };
 	      process = UTHashGet(unit->processes, &search);
 	      if(process)
@@ -917,7 +1008,7 @@ extern "C" {
 	    }
 	  }
 	  fclose(pidsFile);
-
+	  
 	  if(UTHashN(unit->processes)) {
 	    // mark and sweep - sweep
 	    UTHASH_WALK(unit->processes, process)
@@ -960,7 +1051,7 @@ extern "C" {
 	if(!unit->obj)
 	  unit->obj = my_strdup(val.str);
 
-	myDebug(1, "UNIT OBJ[obj=\"%s\"]", val.str);
+	EVDebug(mod, 1, "UNIT OBJ[obj=\"%s\"]", val.str);
 	dbusMethod(mod,
 		   handler_controlGroup,
 		   unit,
@@ -1030,7 +1121,7 @@ extern "C" {
 		unit = HSPDBusUnitNew(mod, nm.str);
 		UTHashAdd(mdata->units, unit);
 	      }
-	      myDebug(1, "UNIT[name=\"%s\" descr=\"%s\" load=\"%s\" active=\"%s\"]", nm.str, ds.str, ls.str, as.str);
+	      EVDebug(mod, 1, "UNIT[name=\"%s\" descr=\"%s\" load=\"%s\" active=\"%s\"]", nm.str, ds.str, ls.str, as.str);
 	      dbusMethod(mod,
 			 handler_getUnit,
 			 unit,
@@ -1078,7 +1169,7 @@ extern "C" {
 #endif
 
     if(UTHashN(mdata->dbusRequests)) {
-      myDebug(1, "SYSTEMD: dbusSynchronize - outstanding requests=%u", UTHashN(mdata->dbusRequests));
+      EVDebug(mod, 1, "SYSTEMD: dbusSynchronize - outstanding requests=%u", UTHashN(mdata->dbusRequests));
       struct timespec now;
       EVClockMono(&now);
       HSPDBusRequest *req;
@@ -1103,190 +1194,55 @@ extern "C" {
 		 HSP_dbusMethod_endargs);
     }
   }
-
-  /*_________________---------------------------__________________
-    _________________   requestListenSocks      __________________
-    -----------------___________________________------------------
-  */
-  #define MAGIC_SEQ_TCP4 515514
-  #define MAGIC_SEQ_TCP6 515516
-  #define MAGIC_SEQ_UDP4 515524
-  #define MAGIC_SEQ_UDP6 515526
-
-  static void requestListenSocks(EVMod *mod, uint32_t seqNo) {
-    HSP_mod_SYSTEMD *mdata = (HSP_mod_SYSTEMD *)mod->data;
-    int family=0,protocol=0;
-    switch(seqNo) {
-    case MAGIC_SEQ_TCP4:
-      family = AF_INET;
-      protocol = IPPROTO_TCP;
-      break;
-    case MAGIC_SEQ_TCP6:
-      family = AF_INET6;
-      protocol = IPPROTO_TCP;
-      break;
-    case MAGIC_SEQ_UDP4:
-      family = AF_INET;
-      protocol = IPPROTO_UDP;
-      break;
-    case MAGIC_SEQ_UDP6:
-      family = AF_INET6;
-      protocol = IPPROTO_UDP;
-      break;
-    }
-    if(family) {
-      // UDP sockets use the same state flags as TCP, with TCP_CLOSE being
-      // the initial state for a listening socket, bound or unbound,
-      // and TCP_ESTABLISHED being the state for a client socket.
-      EnumKernelTCPState state = (protocol == IPPROTO_TCP) ? TCP_LISTEN : TCP_CLOSE;
-      struct inet_diag_req_v2 diag_req = { .sdiag_family = family,
-					   .sdiag_protocol = protocol,
-					   .idiag_states = (1<<state),
-					   .id.idiag_cookie = { INET_DIAG_NOCOOKIE,
-								INET_DIAG_NOCOOKIE } };
-      UTNLDiag_send(mdata->nl_sock, &diag_req, sizeof(diag_req), YES, seqNo);
-    }
-  }
-
-  /*_________________---------------------------__________________
-    _________________         readNL            __________________
-    -----------------___________________________------------------
-  */
-
-  static void diagCB(void *magic, int sockFd, uint32_t seqNo, struct inet_diag_msg *diag_msg, int rtalen) {
-    EVMod *mod = (EVMod *)magic;
-    HSP_mod_SYSTEMD *mdata = (HSP_mod_SYSTEMD *)mod->data;
-    char *protocol = NULL;
-    HSPListenSock search = { };
-    // use the seqNo as a "queryNo" to imply family and protocol since it does
-    // not appear in the diag_msg sockid.
-    switch(seqNo) {
-    case MAGIC_SEQ_TCP4:
-      protocol = "TCP4";
-      search.sapId.protocol = IPPROTO_TCP;
-      //search.sapId.addr.type = SFLADDRESSTYPE_IP_V4;
-      break;
-    case MAGIC_SEQ_TCP6:
-      protocol = "TCP6";
-      search.sapId.protocol = IPPROTO_TCP;
-      //search.sapId.addr.type = SFLADDRESSTYPE_IP_V6;
-      break;
-    case MAGIC_SEQ_UDP4:
-      protocol = "UDP4";
-      search.sapId.protocol = IPPROTO_UDP;
-      //search.sapId.addr.type = SFLADDRESSTYPE_IP_V4;
-      break;
-    case MAGIC_SEQ_UDP6:
-      protocol = "UDP6";
-      search.sapId.protocol = IPPROTO_UDP;
-      //search.sapId.addr.type = SFLADDRESSTYPE_IP_V6;
-      break;
-    }
-    if(protocol) {
-      struct passwd *uid_info = getpwuid(diag_msg->idiag_uid);
-      myDebug(1, "diag_msg: %s UID=%u(%s) state=%u rqueue=%u inode=%u sock=%s",
-	      protocol,
-	      diag_msg->idiag_uid,
-	      uid_info->pw_name,
-	      diag_msg->idiag_state,
-	      diag_msg->idiag_rqueue,
-	      diag_msg->idiag_inode,
-	      UTNLDiag_sockid_print(&diag_msg->id));
-      //if(search.sapId.addr.type == SFLADDRESSTYPE_IP_V4)
-      // memcpy(&search.sapId.addr.address.ip_v4, diag_msg->id.idiag_src, 4);
-      //else
-      // memcpy(&search.sapId.addr.address.ip_v6, diag_msg->id.idiag_src, 16);
-      search.sapId.port = ntohs(diag_msg->id.idiag_sport);
-      HSPListenSock *listenSock = UTHashGet(mdata->listenSocks, &search);
-      if(listenSock) {
-	listenSock->marked = NO;
-	if(listenSock->inode != diag_msg->idiag_inode) {
-	  UTHashDel(mdata->listenSocksByInode, listenSock);
-	  listenSock->inode = diag_msg->idiag_inode;
-	  UTHashAdd(mdata->listenSocksByInode, listenSock);
-	  mdata->listenSocksRev++;
-	}
-      }
-      else {
-	listenSock = (HSPListenSock *)my_calloc(sizeof(HSPListenSock));
-	listenSock->sapId = search.sapId;
-	listenSock->inode = diag_msg->idiag_inode;
-	UTHashAdd(mdata->listenSocks, listenSock);
-	UTHashAdd(mdata->listenSocksByInode, listenSock);
-	mdata->listenSocksRev++;
-      }
-    }
-  }
-
-  static void readNL(EVMod *mod, EVSocket *sock, void *magic) {
-    HSP_mod_SYSTEMD *mdata = (HSP_mod_SYSTEMD *)mod->data;
-    UTNLDiag_recv(mod, mdata->nl_sock, diagCB);
-  }
-
-  /*_________________---------------------------__________________
-    _________________    dsIndexForSAP          __________________
-    -----------------___________________________------------------
-    packet bus!
-  */
-  static uint32_t dsIndexForSAP(EVMod *mod, uint8_t protocol, uint16_t port) {
-    HSP_mod_SYSTEMD *mdata = (HSP_mod_SYSTEMD *)mod->data;
-    HSPListenSock search = { .sapId = { .protocol = protocol, .port = port } };
-    HSPListenSock *lsock = UTHashGet(mdata->listenSocks, &search);
-    if(lsock
-       && lsock->unit) {
-      HSPVMState_SYSTEMD *container = UTHashGet(mdata->vmsByUUID, lsock->unit->uuid);
-      if(container) {
-	HSPVMState *vm = (HSPVMState *)&container->vm;
-	return vm->dsIndex;
-      }
-    }
-    return 0;
-  }
 	
   /*_________________---------------------------__________________
-    _________________       evt_flow_sample     __________________
+    _________________  evt_flow_sample_released __________________
     -----------------___________________________------------------
     packet bus!
   */
 
-  static void evt_flow_sample(EVMod *mod, EVEvent *evt, void *data, size_t dataLen) {
+  static void evt_flow_sample_released(EVMod *mod, EVEvent *evt, void *data, size_t dataLen) {
     HSP_mod_SYSTEMD *mdata = (HSP_mod_SYSTEMD *)mod->data;
-    HSP *sp = (HSP *)EVROOTDATA(mod);
+    uint32_t src_dsIndex=0;
+    uint32_t dst_dsIndex=0;
     mdata->packetSamples++; // used to enable socket lookup
+
     HSPPendingSample *ps = (HSPPendingSample *)data;
-    int ip_ver = decodePendingSample(ps);
-    if((ip_ver == 4 || ip_ver == 6)
-       && (ps->ipproto == IPPROTO_TCP || ps->ipproto == IPPROTO_UDP)) {
-      // was it to/from this host?
-      bool local_src = isLocalAddress(sp, &ps->src);
-      bool local_dst = isLocalAddress(sp, &ps->dst);
-      if(local_src || local_dst) {
-	// yes - was it to/from a known socket?
-	uint16_t l4ports[2];
-	memcpy(l4ports, ps->hdr + ps->l4_offset, 4);
-	uint16_t srcPort = htons(l4ports[0]);
-	uint16_t dstPort = htons(l4ports[1]);
-	uint32_t src_dsIndex=0, dst_dsIndex=0;
-	if(local_src)
-	  src_dsIndex = dsIndexForSAP(mod, ps->ipproto, srcPort);
-	if(local_dst)
-	  dst_dsIndex = dsIndexForSAP(mod, ps->ipproto, dstPort);
-	if(src_dsIndex || dst_dsIndex) {
-	  // yes - add annotation
-	  myDebug(1, "%s adding entities structure: src=%u dst=%u", mod->name, src_dsIndex, dst_dsIndex);
-	  SFLFlow_sample_element *entElem = pendingSample_calloc(ps, sizeof(SFLFlow_sample_element));
-	  entElem->tag = SFLFLOW_EX_ENTITIES;
-	  if(src_dsIndex) {
-	    entElem->flowType.entities.src_dsClass = SFL_DSCLASS_LOGICAL_ENTITY;
-	    entElem->flowType.entities.src_dsIndex = src_dsIndex;
-	  }
-	  if(dst_dsIndex) {
-	    entElem->flowType.entities.dst_dsClass = SFL_DSCLASS_LOGICAL_ENTITY;
-	    entElem->flowType.entities.dst_dsIndex = dst_dsIndex;
-	  }
-	  SFLADD_ELEMENT(ps->fs, entElem);
-	}
+    // INET_DIAG lookup may have found a cgroup_id.  If so, it will be the
+    // inode of the container that sent or received it. This appeared in kernel ~ 5.15 (ubuntu22).
+    if(ps->cgroup_id) {
+      EVDebug(mod, 2, "mod_systemd: inet_diag cgroup = %u", ps->cgroup_id);
+      HSPVMState_SYSTEMD search = { .cgroup_id = ps->cgroup_id };
+      HSPVMState_SYSTEMD *container = UTHashGet(mdata->vmsByCgroupId, &search);
+      if(container) {
+	EVDebug(mod, 2, "mod_systemd: cgroup_id(%u)->container(%s) dsIndex=%u",
+		ps->cgroup_id,
+		container->id,
+		container->vm.dsIndex);
+	if(ps->localSrc)
+	  src_dsIndex = container->vm.dsIndex;
+	else
+	  dst_dsIndex = container->vm.dsIndex;
       }
+    }
+
+    // Removed inefficient socket inode to cgroup lookup - above mechanism will work better.
+
+    if(src_dsIndex
+       || dst_dsIndex) {
+      // yes - add annotation
+      EVDebug(mod, 1, "%s adding entities structure: src=%u dst=%u", mod->name, src_dsIndex, dst_dsIndex);
+      SFLFlow_sample_element *entElem = pendingSample_calloc(ps, sizeof(SFLFlow_sample_element));
+      entElem->tag = SFLFLOW_EX_ENTITIES;
+      if(src_dsIndex) {
+	entElem->flowType.entities.src_dsClass = SFL_DSCLASS_LOGICAL_ENTITY;
+	entElem->flowType.entities.src_dsIndex = src_dsIndex;
+      }
+      if(dst_dsIndex) {
+	entElem->flowType.entities.dst_dsClass = SFL_DSCLASS_LOGICAL_ENTITY;
+	entElem->flowType.entities.dst_dsIndex = dst_dsIndex;
+      }
+      SFLADD_ELEMENT(ps->fs, entElem);
     }
   }
 
@@ -1298,46 +1254,6 @@ extern "C" {
   static void evt_config_first(EVMod *mod, EVEvent *evt, void *data, size_t dataLen) {
     HSP_mod_SYSTEMD *mdata = (HSP_mod_SYSTEMD *)mod->data;
     mdata->countdownToResync = HSP_SYSTEMD_WAIT_STARTUP;
-    if(mdata->listenSocks) {
-      if((mdata->nl_sock = UTNLDiag_open()) > 0)
-	EVBusAddSocket(mod, EVCurrentBus(), mdata->nl_sock, readNL, NULL);
-    }
-  }
-
-  /*_________________---------------------------__________________
-    _________________    markListenSockets      __________________
-    -----------------___________________________------------------
-    TODO: lock?
-  */
-  static void markListenSockets(EVMod *mod) {
-    HSP_mod_SYSTEMD *mdata = (HSP_mod_SYSTEMD *)mod->data;
-    HSPListenSock *lsock;
-    UTHASH_WALK(mdata->listenSocks, lsock)
-      lsock->marked = YES;
-  }
-  
-  /*_________________---------------------------__________________
-    _________________    sweepListenSockets     __________________
-    -----------------___________________________------------------
-    TODO: lock?
-  */
-  static void sweepListenSockets(EVMod *mod) {
-    HSP_mod_SYSTEMD *mdata = (HSP_mod_SYSTEMD *)mod->data;
-    HSPListenSock *lsock;
-    UTHASH_WALK(mdata->listenSocks, lsock) {
-      if(lsock->marked) {
-	UTHashDel(mdata->listenSocks, lsock);
-	UTHashDel(mdata->listenSocksByInode, lsock);
-	// TODO: we could just invalidate the socket with a bit,
-	// or by clearing the inode.  That might be more
-	// stable memory-wise?  Especially if a unit is
-	// appearing and disappearing repeatedly.  It depends
-	// on how big the table could get. 32K entries max
-	// if not using address in SapId.
-	my_free(lsock);
-	mdata->listenSocksRev++;
-      }
-    }
   }
 
   /*_________________---------------------------__________________
@@ -1349,48 +1265,14 @@ extern "C" {
     HSP_mod_SYSTEMD *mdata = (HSP_mod_SYSTEMD *)mod->data;
     HSP *sp = (HSP *)EVROOTDATA(mod);
 
-    // Space the listen socket requests apart by clicking through a state machine here.
-    // This is partly to smooth the netlink load and partly because the netlink socket
-    // will not let us queue multiple requests at once (not sure why not).
-    if(mdata->nextListenSockQuery) {
-      // run this query
-      requestListenSocks(mod, mdata->nextListenSockQuery);
-      // decide what to do next tick
-      switch(mdata->nextListenSockQuery) {
-      case MAGIC_SEQ_TCP4: mdata->nextListenSockQuery = MAGIC_SEQ_TCP6; break;
-      case MAGIC_SEQ_TCP6: mdata->nextListenSockQuery = MAGIC_SEQ_UDP4; break;
-      case MAGIC_SEQ_UDP4: mdata->nextListenSockQuery = MAGIC_SEQ_UDP6; break;
-      case MAGIC_SEQ_UDP6:
-	// that was the last one - clean up
-	mdata->nextListenSockQuery = 0;
-	sweepListenSockets(mod);
-	break;
-      }
-    }
-	
     if(mdata->countdownToResync) {
       if(--mdata->countdownToResync == 0) {
 	// refresh units
 	dbusSynchronize(mod);
-	if(mdata->listenSocks && mdata->packetSamples) {
-	  // kick off the sequence that refreshes the listenSockets
-	  markListenSockets(mod);
-	  mdata->nextListenSockQuery = MAGIC_SEQ_TCP4;
-	}
 	// next countdown
 	mdata->countdownToResync = sp->systemd.refreshVMListSecs ?: sp->refreshVMListSecs;
       }
     }
-  }
-
-  static void evt_tock(EVMod *mod, EVEvent *evt, void *data, size_t dataLen) {
-    HSP_mod_SYSTEMD *mdata = (HSP_mod_SYSTEMD *)mod->data;
-    // now we can execute pollActions without holding on to the semaphore
-    HSPVMState_SYSTEMD *container;
-    UTHASH_WALK(mdata->pollActions, container) {
-      getCounters_SYSTEMD(mod, container);
-    }
-    UTHashReset(mdata->pollActions);
   }
 
   // obtaining a selectable file-descriptor from libdbus is not as easy
@@ -1418,7 +1300,7 @@ extern "C" {
     dbpoll = YES
 #endif
     if(dbpoll) {
-      myDebug(2, "SYSTEMD deci - outstanding=%u tx=%u rx=%u", UTHashN(mdata->dbusRequests), mdata->dbus_tx, mdata->dbus_rx);
+      EVDebug(mod, 2, "SYSTEMD deci - outstanding=%u tx=%u rx=%u", UTHashN(mdata->dbusRequests), mdata->dbus_tx, mdata->dbus_rx);
       uint32_t curr_tx = mdata->dbus_tx;
       uint32_t curr_rx = mdata->dbus_rx;
       for(;;) {
@@ -1522,10 +1404,9 @@ static DBusHandlerResult dbusCB(DBusConnection *connection, DBusMessage *message
 
     requestVNodeRole(mod, HSP_VNODE_PRIORITY_SYSTEMD);
 
-    // path formats for cgroup info - can be overridden in config
-    mdata->cgroup_procs = sp->systemd.cgroup_procs ?: HSP_SYSTEMD_CGROUP_PROCS;
-    mdata->cgroup_acct = sp->systemd.cgroup_acct ?: HSP_SYSTEMD_CGROUP_ACCT;
-    
+    // learn cgroup controller paths from /proc/mounts...
+    readCgroupPaths(mod);
+
     // get page size for scaling memory pages->bytes
 #if defined(PAGESIZE)
     mdata->page_size = PAGESIZE;
@@ -1538,16 +1419,14 @@ static DBusHandlerResult dbusCB(DBusConnection *connection, DBusMessage *message
     // packet bus
     if(sp->systemd.markTraffic) {
       mdata->packetBus = EVGetBus(mod, HSPBUS_PACKET, YES);
-      EVEventRx(mod, EVGetEvent(mdata->packetBus, HSPEVENT_FLOW_SAMPLE), evt_flow_sample);
-      mdata->listenSocks = UTHASH_NEW(HSPListenSock, sapId, UTHASH_SYNC); // need sync (poll + packet thread)
-      mdata->listenSocksByInode = UTHASH_NEW(HSPListenSock, inode, UTHASH_DFLT); // only used in poll thread
+      EVEventRx(mod, EVGetEvent(mdata->packetBus, HSPEVENT_FLOW_SAMPLE_RELEASED), evt_flow_sample_released);
     }
 
     // poll bus
     mdata->pollBus = EVGetBus(mod, HSPBUS_POLL, YES);
     mdata->vmsByUUID = UTHASH_NEW(HSPVMState_SYSTEMD, vm.uuid, UTHASH_DFLT);
     mdata->vmsByID = UTHASH_NEW(HSPVMState_SYSTEMD, id, UTHASH_SKEY);
-    mdata->pollActions = UTHASH_NEW(HSPVMState_SYSTEMD, id, UTHASH_IDTY);
+    mdata->vmsByCgroupId = UTHASH_NEW(HSPVMState_SYSTEMD, cgroup_id, UTHASH_DFLT);
     mdata->dbusRequests = UTHASH_NEW(HSPDBusRequest, serial, UTHASH_DFLT);
     mdata->units = UTHASH_NEW(HSPDBusUnit, name, UTHASH_SKEY);
 
@@ -1577,7 +1456,6 @@ static DBusHandlerResult dbusCB(DBusConnection *connection, DBusMessage *message
     // connection OK - so register call-backs
     EVEventRx(mod, EVGetEvent(mdata->pollBus, EVEVENT_TICK), evt_tick);
     EVEventRx(mod, EVGetEvent(mdata->pollBus, EVEVENT_DECI), evt_deci);
-    EVEventRx(mod, EVGetEvent(mdata->pollBus, EVEVENT_TOCK), evt_tock);
     EVEventRx(mod, EVGetEvent(mdata->pollBus, HSPEVENT_HOST_COUNTER_SAMPLE), evt_host_cs);
     EVEventRx(mod, EVGetEvent(mdata->pollBus, HSPEVENT_CONFIG_FIRST), evt_config_first);
   }

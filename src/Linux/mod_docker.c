@@ -53,6 +53,8 @@ extern "C" {
     HSP_EV_resize,
     HSP_EV_top,
     HSP_EV_update,
+    HSP_EV_exec_die,
+    HSP_EV_prune,
     HSP_EV_NUM_CODES
   } EnumHSPContainerEvent;
 
@@ -81,7 +83,9 @@ extern "C" {
     "rename",
     "resize",
     "top",
-    "update"
+    "update",
+    "exec_die", // added for 1.43 VVV
+    "prune"
   };
 
   typedef enum {
@@ -180,12 +184,18 @@ extern "C" {
 
 #define HSP_DOCKER_SOCK  VARFS_STR "/run/docker.sock"
 #define HSP_DOCKER_MAX_CONCURRENT 15
-#define HSP_DOCKER_HTTP " HTTP/1.1\nHost: " HSP_DOCKER_SOCK "\n\n"
+  // note: used to set Host: HSP_DOCKER_SOCK but started to see
+  // "malformed host header" errors so switched to Host: http
+  // which emulates the request that curl(1) sends.
+#define HSP_DOCKER_HTTP " HTTP/1.1\nHost: http\n\n"
+  // HTTP 1.1 keeps the connection open by default, so to keep the
+  // transaction socket-logic the same below we now add the "Connection: close" header.
+#define HSP_DOCKER_HTTP_CLOSE " HTTP/1.1\nHost: http\nConnection: close\n\n"
 #define HSP_DOCKER_API "v1.24"
 #define HSP_DOCKER_REQ_EVENTS "GET /" HSP_DOCKER_API "/events?filters={\"type\":[\"container\"]}" HSP_DOCKER_HTTP
-#define HSP_DOCKER_REQ_CONTAINERS "GET /" HSP_DOCKER_API "/containers/json" HSP_DOCKER_HTTP
-#define HSP_DOCKER_REQ_INSPECT_ID "GET /" HSP_DOCKER_API "/containers/%s/json" HSP_DOCKER_HTTP
-#define HSP_DOCKER_REQ_STATS_ID "GET /" HSP_DOCKER_API "/containers/%s/stats?stream=false" HSP_DOCKER_HTTP
+#define HSP_DOCKER_REQ_CONTAINERS "GET /" HSP_DOCKER_API "/containers/json" HSP_DOCKER_HTTP_CLOSE
+#define HSP_DOCKER_REQ_INSPECT_ID "GET /" HSP_DOCKER_API "/containers/%s/json" HSP_DOCKER_HTTP_CLOSE
+#define HSP_DOCKER_REQ_STATS_ID "GET /" HSP_DOCKER_API "/containers/%s/stats?stream=false" HSP_DOCKER_HTTP_CLOSE
 #define HSP_CONTENT_LENGTH_REGEX "^Content-Length: ([0-9]+)$"
   
 #define HSP_DOCKER_MAX_FNAME_LEN 255
@@ -212,18 +222,10 @@ extern "C" {
 #define HSP_VNIC_REFRESH_TIMEOUT 300
 #define HSP_CGROUP_REFRESH_TIMEOUT 600
 
-  typedef enum {
-    HSP_VNIC_LAYER_NONE,
-    HSP_VNIC_LAYER_MAC,
-    HSP_VNIC_LAYER_IP,
-    HSP_VNIC_LAYER_IPIP
-  } EnumHSPVNICLayer;
-
   typedef struct _HSP_mod_DOCKER {
     EVBus *pollBus;
     UTHash *vmsByUUID;
     UTHash *vmsByID;
-    UTHash *pollActions;
     SFLCounters_sample_element vnodeElem;
     bool dockerSync:1;
     bool dockerFlush:1;
@@ -250,7 +252,6 @@ extern "C" {
     uint32_t dup_names;
     uint32_t dup_hostnames;
     struct stat myNS;
-    EnumHSPVNICLayer vnicLayer;
     UTHash *vnicByIP;
   } HSP_mod_DOCKER;
 
@@ -305,7 +306,7 @@ extern "C" {
   static int containerLinkCB(EVMod *mod, HSPVMState_DOCKER *container, char *line) {
     HSP_mod_DOCKER *mdata = (HSP_mod_DOCKER *)mod->data;
     HSP *sp = (HSP *)EVROOTDATA(mod);
-    myDebug(1, "containerLinkCB: line=<%s>", line);
+    EVDebug(mod, 1, "containerLinkCB: line=<%s>", line);
     char deviceName[HSP_DOCKER_MAX_LINELEN];
     char macStr[HSP_DOCKER_MAX_LINELEN];
     char ipStr[HSP_DOCKER_MAX_LINELEN];
@@ -315,7 +316,7 @@ extern "C" {
       if(hexToBinary((u_char *)macStr, mac, 6) == 6) {
 	SFLAdaptor *adaptor = adaptorListGet(container->vm.interfaces, deviceName);
 	if(adaptor == NULL) {
-	  adaptor = nioAdaptorNew(deviceName, mac, ifIndex);
+	  adaptor = nioAdaptorNew(mod, deviceName, mac, ifIndex);
 	  adaptorListAdd(container->vm.interfaces, adaptor);
 	  // add to "all namespaces" collections too - but only the ones where
 	  // the id is really global.  For example,  many containers can have
@@ -326,53 +327,69 @@ extern "C" {
 
 	  if(UTHashGet(sp->adaptorsByMac, adaptor) == NULL)
 	    if(UTHashAdd(sp->adaptorsByMac, adaptor) != NULL)
-	      myDebug(1, "Warning: container adaptor overwriting adaptorsByMac");
+	      EVDebug(mod, 1, "Warning: container adaptor overwriting adaptorsByMac");
 
 	  if(UTHashGet(sp->adaptorsByIndex, adaptor) == NULL)
 	    if(UTHashAdd(sp->adaptorsByIndex, adaptor) != NULL)
-	      myDebug(1, "Warning: container adaptor overwriting adaptorsByIndex");
+	      EVDebug(mod, 1, "Warning: container adaptor overwriting adaptorsByIndex");
+	}
+	else {
+	  // clear mark
+	  unmarkAdaptor(adaptor);
+	}
 
-	  // mark it as a vm/container device
-	  ADAPTOR_NIO(adaptor)->vm_or_container = YES;
-
-	  // did we get an ip address too?
-	  SFLAddress ipAddr = { };
-	  if(parseNumericAddress(ipStr, NULL, &ipAddr, AF_INET)) {
-	    if(!SFLAddress_isZero(&ipAddr)
-	       && mdata->vnicByIP) {
-	      myDebug(1, "VNIC: learned virtual ipAddr: %s", ipStr);
-	      // Can use this to associate traffic with this container
-	      // if this address appears in sampled packet header as
-	      // outer or inner IP
-	      ADAPTOR_NIO(adaptor)->ipAddr = ipAddr;
-	      HSPVNIC search = { .ipAddr = ipAddr };
-	      HSPVNIC *vnic = UTHashGet(mdata->vnicByIP, &search);
-	      if(vnic) {
-		// found IP - check for non-unique mapping
-		if(vnic->dsIndex != container->vm.dsIndex) {
-		  myDebug(1, "VNIC: clash between %s (ds=%u) and %s (ds=%u) -- setting unique=no",
-			  vnic->c_name,
-			  vnic->dsIndex,
-			  container->name,
-			  container->vm.dsIndex);
-		  vnic->unique = NO;
-		}
-	      }
-	      else {
-		// add new VNIC entry
-		vnic = (HSPVNIC *)my_calloc(sizeof(HSPVNIC));
-		vnic->ipAddr = ipAddr;
-		vnic->dsIndex = container->vm.dsIndex;
-		vnic->c_name = my_strdup(container->name);
-		UTHashAdd(mdata->vnicByIP, vnic);
-		vnic->unique = YES;
-		myDebug(1, "VNIC: linked to %s (ds=%u)",
+	// mark it as a vm/container device
+	// and record the dsIndex there for easy mapping later
+	// provided it is unique.  Otherwise set it to all-ones
+	// to indicate that it should not be used to map to container.
+	HSPAdaptorNIO *nio = ADAPTOR_NIO(adaptor);
+	nio->vm_or_container = YES;
+	if(nio->container_dsIndex != container->vm.dsIndex) {
+	  if(nio->container_dsIndex == 0)
+	    nio->container_dsIndex = container->vm.dsIndex;
+	  else {
+	    EVDebug(mod, 1, "Warning: NIC already claimed by container with dsIndex==nio->container_dsIndex");
+	    // mark is as not a unique mapping
+	    nio->container_dsIndex = 0xFFFFFFFF;
+	  }
+	}
+	
+	// did we get an ip address too?
+	SFLAddress ipAddr = { };
+	if(parseNumericAddress(ipStr, NULL, &ipAddr, PF_INET)) {
+	  if(!SFLAddress_isZero(&ipAddr)
+	     && mdata->vnicByIP) {
+	    EVDebug(mod, 1, "VNIC: learned virtual ipAddr: %s", ipStr);
+	    // Can use this to associate traffic with this container
+	    // if this address appears in sampled packet header as
+	    // outer or inner IP
+	    ADAPTOR_NIO(adaptor)->ipAddr = ipAddr;
+	    HSPVNIC search = { .ipAddr = ipAddr };
+	    HSPVNIC *vnic = UTHashGet(mdata->vnicByIP, &search);
+	    if(vnic) {
+	      // found IP - check for non-unique mapping
+	      if(vnic->dsIndex != container->vm.dsIndex) {
+		EVDebug(mod, 1, "VNIC: clash between %s (ds=%u) and %s (ds=%u) -- setting unique=no",
 			vnic->c_name,
-			vnic->dsIndex);
+			vnic->dsIndex,
+			container->name,
+			container->vm.dsIndex);
+		vnic->unique = NO;
 	      }
 	    }
+	    else {
+	      // add new VNIC entry
+	      vnic = (HSPVNIC *)my_calloc(sizeof(HSPVNIC));
+	      vnic->ipAddr = ipAddr;
+	      vnic->dsIndex = container->vm.dsIndex;
+	      vnic->c_name = my_strdup(container->name);
+	      UTHashAdd(mdata->vnicByIP, vnic);
+	      vnic->unique = YES;
+	      EVDebug(mod, 1, "VNIC: linked to %s (ds=%u)",
+		      vnic->c_name,
+		      vnic->dsIndex);
+	    }
 	  }
-
 	}
       }
     }
@@ -399,7 +416,7 @@ extern "C" {
   int readContainerInterfaces(EVMod *mod, HSPVMState_DOCKER *container)  {
     HSP_mod_DOCKER *mdata = (HSP_mod_DOCKER *)mod->data;
     pid_t nspid = container->pid;
-    myDebug(2, "readContainerInterfaces: pid=%u", nspid);
+    EVDebug(mod, 2, "readContainerInterfaces: pid=%u", nspid);
     if(nspid == 0) return 0;
 
     // do the dirty work after a fork, so we can just exit afterwards,
@@ -432,10 +449,10 @@ extern "C" {
 
       struct stat statBuf;
       if(fstat(nsfd, &statBuf) == 0) {
-	myDebug(2, "container namespace dev.inode == %u.%u", statBuf.st_dev, statBuf.st_ino);
+	EVDebug(mod, 2, "container namespace dev.inode == %u.%u", statBuf.st_dev, statBuf.st_ino);
 	if(statBuf.st_dev == mdata->myNS.st_dev
 	   && statBuf.st_ino == mdata->myNS.st_ino) {
-	  myDebug(1, "skip my own namespace");
+	  EVDebug(mod, 1, "skip my own namespace");
 	  exit(0);
 	}
       }
@@ -493,7 +510,7 @@ extern "C" {
 		// ifIndex and MAC when looking at container interfaces
 		if(ioctl(fd,SIOCGIFINDEX, &ifr) < 0) {
 		  // only complain about this if we are debugging
-		  myDebug(1, "container device %s Get SIOCGIFINDEX failed : %s",
+		  EVDebug(mod, 1, "container device %s Get SIOCGIFINDEX failed : %s",
 			  devName,
 			  strerror(errno));
 		}
@@ -504,7 +521,7 @@ extern "C" {
 		  // see if we can get an IP address
 		  if(ioctl(fd,SIOCGIFADDR, &ifr) < 0) {
 		    // only complain about this if we are debugging
-		    myDebug(1, "device %s Get SIOCGIFADDR failed : %s",
+		    EVDebug(mod, 1, "device %s Get SIOCGIFADDR failed : %s",
 			    devName,
 			    strerror(errno));
 		  }
@@ -519,7 +536,7 @@ extern "C" {
 
 		  // Get the MAC Address for this interface
 		  if(ioctl(fd,SIOCGIFHWADDR, &ifr) < 0) {
-		    myDebug(1, "device %s Get SIOCGIFHWADDR failed : %s",
+		    EVDebug(mod, 1, "device %s Get SIOCGIFHWADDR failed : %s",
 			      devName,
 			      strerror(errno));
 		  }
@@ -685,20 +702,19 @@ extern "C" {
       sp->telemetry[HSP_TELEMETRY_COUNTER_SAMPLES_SUPPRESSED]++;
     }
     else {
-      SEMLOCK_DO(sp->sync_agent) {
-	sfl_poller_writeCountersSample(vm->poller, &cs);
-	sp->counterSampleQueued = YES;
-	sp->telemetry[HSP_TELEMETRY_COUNTER_SAMPLES]++;
-      }
+      sfl_poller_writeCountersSample(vm->poller, &cs);
+      sp->counterSampleQueued = YES;
+      sp->telemetry[HSP_TELEMETRY_COUNTER_SAMPLES]++;
     }
   }
 
   static void agentCB_getCounters_DOCKER_request(void *magic, SFLPoller *poller, SFL_COUNTERS_SAMPLE_TYPE *cs)
   {
     EVMod *mod = (EVMod *)magic;
-    HSP_mod_DOCKER *mdata = (HSP_mod_DOCKER *)mod->data;
     HSPVMState_DOCKER *container = (HSPVMState_DOCKER *)poller->userData;
-    UTHashAdd(mdata->pollActions, container);
+    // have to kick off a query to get this, but it's OK for the pollBus to take a little time.
+    // We no longer have a semaphore that would block anything else.
+    getContainerStats(mod, container);
   }
 
   /*_________________---------------------------__________________
@@ -725,29 +741,24 @@ extern "C" {
 
   static void removeAndFreeVM_DOCKER(EVMod *mod, HSPVMState_DOCKER *container) {
     HSP_mod_DOCKER *mdata = (HSP_mod_DOCKER *)mod->data;
-    if(getDebug()) {
-      myLog(LOG_INFO, "removeAndFreeVM: removing container with dsIndex=%u", container->vm.dsIndex);
-    }
-
+    
+    EVDebug(mod, 1, "removeAndFreeVM: removing container with dsIndex=%u", container->vm.dsIndex);
     
     // remove any VNIC lookups by IP
     // (the interfaces will be removed completely in removeAndFreeVM() below)
     if(mdata->vnicByIP)
       removeContainerVNICLookup(mod, container);
 
-    // remove from pollActions if present (necessary if this happens in tick() and before tock()
-    UTHashDel(mdata->pollActions, container);
-
     // remove from hash tables
     if(UTHashDel(mdata->vmsByID, container) == NULL) {
       myLog(LOG_ERR, "UTHashDel (vmsByID) failed: container %s=%s", container->name, container->id);
-      if(debug(1))
+      if(EVDebug(mod, 1, NULL))
 	containerHTPrint(mdata->vmsByID, "vmsByID");
     }
 
     if(UTHashDel(mdata->vmsByUUID, container) == NULL) {
       myLog(LOG_ERR, "UTHashDel (vmsByUUID) failed: container %s=%s", container->name, container->id);
-      if(debug(1))
+      if(EVDebug(mod, 1, NULL))
 	containerHTPrint(mdata->vmsByUUID, "vmsByUUID");
     }
 
@@ -807,15 +818,14 @@ extern "C" {
   */
 
   static void updateContainerAdaptors(EVMod *mod, HSPVMState_DOCKER *container) {
-    HSP *sp = (HSP *)EVROOTDATA(mod);
     HSPVMState *vm = &container->vm;
     if(vm) {
       // reset the information that we are about to refresh
-      adaptorListMarkAll(vm->interfaces);
+      markAdaptors_adaptorList(mod, vm->interfaces);
       // then refresh it
       readContainerInterfaces(mod, container);
       // and clean up
-      deleteMarkedAdaptors_adaptorList(sp, vm->interfaces);
+      deleteMarkedAdaptors_adaptorList(mod, vm->interfaces);
       adaptorListFreeMarked(vm->interfaces);
     }
   }
@@ -847,7 +857,7 @@ extern "C" {
 		  if(container->cgroup_devices)
 		    my_free(container->cgroup_devices);
 		  container->cgroup_devices = my_strdup(path);
-		  myDebug(1, "docker: container(%s)->cgroup_devices=%s", container->name, container->cgroup_devices);
+		  EVDebug(mod, 1, "container(%s)->cgroup_devices=%s", container->name, container->cgroup_devices);
 		}
 	      }
 	    }
@@ -881,7 +891,7 @@ extern "C" {
     HSP_mod_DOCKER *mdata = (HSP_mod_DOCKER *)mod->data;
 
     if(mdata->currentRequests || mdata->queuedRequests || mdata->waitingRequests) {
-      myDebug(1, "docker currentRequests=%d, queuedRequests=%d, waitingRequests=%d, generatedRequests=%d, lostRequests=%d, statsWaitRequests=%d containers=%d, names=%d, hostnames=%d",
+      EVDebug(mod, 1, "currentRequests=%d, queuedRequests=%d, waitingRequests=%d, generatedRequests=%d, lostRequests=%d, statsWaitRequests=%d containers=%d, names=%d, hostnames=%d",
 	      mdata->currentRequests,
 	      mdata->queuedRequests,
 	      mdata->waitingRequests,
@@ -894,16 +904,16 @@ extern "C" {
     }
 
     if(mdata->countdownToResync) {
-      myDebug(1, "docker resync in %u", mdata->countdownToResync);
+      EVDebug(mod, 1, "resync in %u", mdata->countdownToResync);
       if(--mdata->countdownToResync == 0)
 	dockerSynchronize(mod);
     }
     if(mdata->countdownToRecheck) {
       if(--mdata->countdownToRecheck == 0) {
-	// ebuild regex patterns periodically
+	// rebuild regex patterns periodically
 	buildRegexPatterns(mod);
 	// and check for missed containers
-	myDebug(1, "docker container recheck");
+	EVDebug(mod, 1, "container recheck");
 	dockerContainerCapture(mod);
       }
     }
@@ -913,22 +923,6 @@ extern "C" {
 #endif
       serviceRequestQ(mod);
       serviceLostRequests(mod);
-    }
-  }
-
-  static void evt_tock(EVMod *mod, EVEvent *evt, void *data, size_t dataLen) {
-    HSP_mod_DOCKER *mdata = (HSP_mod_DOCKER *)mod->data;
-    // now we can execute pollActions without holding on to the semaphore.
-    // But each pollAction now needs another step while we request and wait
-    // for the container stats query.  So now we initiate the stats query
-    // here and finally call getCounters_DOCKER when we have the answer.
-    if(!mdata->dockerFlush) {
-      HSPVMState_DOCKER *container;
-      UTHASH_WALK(mdata->pollActions, container) {
-	// getCounters_DOCKER(mod, container);
-	getContainerStats(mod, container);
-      }
-      UTHashReset(mdata->pollActions);
     }
   }
 
@@ -1074,25 +1068,25 @@ extern "C" {
 	if(vvstr
 	   && my_strnequal(vvstr, HSP_NVIDIA_VIS_DEV_ENV, vlen)
 	   && vvstr[vlen] == '=') {
-	  myDebug(2, "parsing GPU env: %s", vvstr);
+	  EVDebug(mod, 2, "parsing GPU env: %s", vvstr);
 	  char *gpu_uuids = vvstr + vlen + 1;
 	  clearContainerGPUs(mod, container);
 	  // (re)populate
 	  char *str;
 	  char buf[128];
 	  while((str = parseNextTok(&gpu_uuids, ",", NO, 0, YES, buf, 128)) != NULL) {
-	    myDebug(2, "parsing GPU uuidstr: %s", str);
+	    EVDebug(mod, 2, "parsing GPU uuidstr: %s", str);
 	    // expect GPU-<uuid>
 	    if(my_strnequal(str, "GPU-", 4)) {
 	      HSPGpuID *gpu = my_calloc(sizeof(HSPGpuID));
 	      if(parseUUID(str + 4, gpu->uuid)) {
 		gpu->has_uuid = YES;
-		myDebug(2, "adding GPU uuid to container: %s", container->name);
+		EVDebug(mod, 2, "adding GPU uuid to container: %s", container->name);
 		UTArrayAdd(arr, gpu);
 		container->gpu_env = YES;
 	      }
 	      else {
-		myDebug(2, "GPU uuid parse failed");
+		EVDebug(mod, 2, "GPU uuid parse failed");
 		my_free(gpu);
 	      }
 	    }
@@ -1143,7 +1137,7 @@ extern "C" {
 	      HSPGpuID *gpu = my_calloc(sizeof(HSPGpuID));
 	      gpu->minor = minor;
 	      gpu->has_minor = YES;
-	      myDebug(2, "adding GPU dev to container: %s", container->name);
+	      EVDebug(mod, 2, "adding GPU dev to container: %s", container->name);
 	      UTArrayAdd(arr, gpu);
 	    }
 	  }
@@ -1155,7 +1149,7 @@ extern "C" {
 
   static void dockerAPI_inspect(EVMod *mod, UTStrBuf *buf, cJSON *jcont, HSPDockerRequest *req) {
     HSP_mod_DOCKER *mdata = (HSP_mod_DOCKER *)mod->data;
-    myDebug(1, "dockerAPI_inspect");
+    EVDebug(mod, 1, "dockerAPI_inspect");
 
     cJSON *jid = cJSON_GetObjectItem(jcont, "Id");
     cJSON *jname = cJSON_GetObjectItem(jcont, "Name");
@@ -1516,7 +1510,7 @@ extern "C" {
     "storage_stats": {}
 }
     */
-    myDebug(1, "dockerAPI_stats");
+    EVDebug(mod, 1, "dockerAPI_stats");
   
     cJSON *jcpu = cJSON_GetObjectItem(jcont, "cpu_stats");
     cJSON *jmem = cJSON_GetObjectItem(jcont, "memory_stats");
@@ -1678,7 +1672,7 @@ extern "C" {
 
   static void dockerAPI_event(EVMod *mod, UTStrBuf *buf, cJSON *top, HSPDockerRequest *req) {
     HSP_mod_DOCKER *mdata = (HSP_mod_DOCKER *)mod->data;
-    myDebug(1, "dockerAPI_event");
+    EVDebug(mod, 1, "dockerAPI_event");
     if(mdata->dockerSync == NO) {
       // just take a copy and queue it for now
       UTArrayAdd(mdata->eventQueue, UTStrBuf_copy(buf));
@@ -1691,14 +1685,14 @@ extern "C" {
     if(status == NULL
        || status->valuestring == NULL
        || my_strlen(status->valuestring) == 0) {
-      myDebug(1, "ignoring event with no status");
+      EVDebug(mod, 1, "ignoring event with no status");
       return;
     }
 
     if(id == NULL
        || id->valuestring == NULL
        || my_strlen(id->valuestring) == 0) {
-      myDebug(1, "ignoring event with no id");
+      EVDebug(mod, 1, "ignoring event with no id");
       return;
     }
 
@@ -1707,7 +1701,7 @@ extern "C" {
     if(type
        && type->valuestring
        && !my_strequal(type->valuestring, "container")) {
-      myDebug(1, "ignoring event for type %s", type->valuestring);
+      EVDebug(mod, 1, "ignoring event for type %s", type->valuestring);
       return;
     }
 
@@ -1729,7 +1723,7 @@ extern "C" {
     HSPVMState_DOCKER *container;
     EnumHSPContainerEvent ev = containerEvent(status->valuestring);
     if(ev == HSP_EV_UNKNOWN) {
-      myDebug(1, "unrecognized event status: %s", status->valuestring);
+      EVDebug(mod, 1, "unrecognized event status: %s", status->valuestring);
       return;
     }
 
@@ -1772,6 +1766,8 @@ extern "C" {
     case HSP_EV_resize:
     case HSP_EV_top:
     case HSP_EV_update:
+    case HSP_EV_exec_die:
+    case HSP_EV_prune:
     default:
       // leave as HSP_CS_UNKNOWN so as not to trigger a state-change below,
       // but still allow for a name update.
@@ -1784,7 +1780,7 @@ extern "C" {
     if(container) {
       if(st != HSP_CS_UNKNOWN
 	 && st != container->state) {
-	myDebug(1, "container state %s -> %s",
+	EVDebug(mod, 1, "container state %s -> %s",
 		containerStateName(container->state),
 		containerStateName(st));
 	container->state = st;
@@ -1812,7 +1808,7 @@ extern "C" {
     
   static void dockerAPI_containers(EVMod *mod, UTStrBuf *buf, cJSON *top, HSPDockerRequest *req) {
     HSP_mod_DOCKER *mdata = (HSP_mod_DOCKER *)mod->data;
-    myDebug(1, "dockerAPI_containers");
+    EVDebug(mod, 1, "dockerAPI_containers");
     // process containers
     int nc = cJSON_GetArraySize(top);
     for(int ii = 0; ii < nc; ii++) {
@@ -1839,7 +1835,7 @@ extern "C" {
 	  cJSON *macaddress = cJSON_GetObjectItem(dev, "MacAddress");
 	  cJSON *ip4address = cJSON_GetObjectItem(dev, "IPAddress");
 	  cJSON *ip6address = cJSON_GetObjectItem(dev, "GlobalIPv6Address");
-	  myDebug(1, "got network %s mac=%s v4=%s v6=%s",
+	  EVDebug(mod, 1, "got network %s mac=%s v4=%s v6=%s",
 		  dev->string,
 		  macaddress ? macaddress->valuestring : "<unknown>",
 		  ip4address ? ip4address->valuestring : "<unknown>",
@@ -1878,19 +1874,18 @@ extern "C" {
     -----------------___________________________------------------
   */
 
-  static void logJSON(int debugLevel, char *msg, cJSON *obj)
+  static void logJSON(char *msg, cJSON *obj)
   {
-    if(debug(debugLevel)) {
-      char *str = cJSON_Print(obj);
-      myLog(LOG_INFO, "%s json=<%s>", msg, str);
-      my_free(str); // TODO: get this fn from cJSON hooks
-    }
+    char *str = cJSON_Print(obj);
+    myLog(LOG_INFO, "%s json=<%s>", msg, str);
+    my_free(str); // TODO: get this fn from cJSON hooks
   }
 
   static void processDockerJSON(EVMod *mod, HSPDockerRequest *req, UTStrBuf *buf) {
     cJSON *top = cJSON_Parse(UTSTRBUF_STR(buf));
     if(top) {
-      logJSON(4, "processDockerJSON:", top);
+      if(EVDebug(mod, 4, NULL))
+	logJSON("processDockerJSON:", top);
       (*req->jsonCB)(mod, buf, top, req);
       cJSON_Delete(top);
     }
@@ -1906,13 +1901,17 @@ extern "C" {
   static void processDockerResponse(EVMod *mod, EVSocket *sock, HSPDockerRequest *req) {
     HSP_mod_DOCKER *mdata = (HSP_mod_DOCKER *)mod->data;
     char *line = UTSTRBUF_STR(sock->ioline);
-    myDebug(2, "processDockerResponse got answer (seqNo=%d): <%s>", req->seqNo, line);
+    EVDebug(mod, 2, "processDockerResponse (state=%u) got answer (seqNo=%d len=%u): <%s>",
+	    req->state,
+	    req->seqNo,
+	    UTSTRBUF_LEN(sock->ioline),
+	    line);
     switch(req->state) {
 
     case HSPDOCKERREQ_HEADERS:
       UTStrBuf_chomp(sock->ioline);
       if(UTRegexExtractInt(mdata->contentLengthPattern, line, 1, &req->contentLength, NULL, NULL)) {
-	myDebug(1, "processDockerResponse seqNo=%d contentLength=%d", req->seqNo,  req->contentLength);
+	EVDebug(mod, 1, "processDockerResponse seqNo=%d contentLength=%d", req->seqNo,  req->contentLength);
       }
       else if(UTSTRBUF_LEN(sock->ioline) == 0) {
 	req->state = req->contentLength
@@ -1933,7 +1932,7 @@ extern "C" {
       req->chunkLength = strtol(line, &endp, 16); // hex
       if(*endp != '\0') {
 	// failed to consume the whole string - must be an error.
-	myDebug(1, "Docker error: <%s> for request(seqNo=%d): <%s>",
+	EVDebug(mod, 1, "error: <%s> for request(seqNo=%d): <%s>",
 		line, req->seqNo, UTSTRBUF_STR(req->request));
 	req->state = HSPDOCKERREQ_ERR;
       }
@@ -1969,7 +1968,7 @@ extern "C" {
       
     case HSPDOCKERREQ_ERR:
       // TODO: just wait for EOF, or should we force the socket to close?
-      myDebug(1, "processDockerResponse seqNo=%d got error", req->seqNo);
+      EVDebug(mod, 1, "processDockerResponse seqNo=%d got error", req->seqNo);
       break;
     }
   }
@@ -2010,7 +2009,7 @@ extern "C" {
     HSP_mod_DOCKER *mdata = (HSP_mod_DOCKER *)mod->data;
     HSPVMState_DOCKER *container;
     UTHASH_WALK(mdata->vmsByID, container) {
-      myDebug(1, "container name=%s state=%s id=%s lastEvent=%d",
+      EVDebug(mod, 1, "container name=%s state=%s id=%s lastEvent=%d",
 	      container->name,
 	      containerStateName(container->state),
 	      container->id,
@@ -2036,7 +2035,7 @@ extern "C" {
       else if((now - req->sendTime) > HSP_DOCKER_REQ_TIMEOUT) {
 	// timeout - the engine seems to have ignored this request. Have to free the resources and possibly resubmit.
 	reqs_lost++;
-	myDebug(1, "serviceLostRequests: req lost seqNo=%d req=<%s>", req->seqNo, UTSTRBUF_STR(req->request));
+	EVDebug(mod, 1, "serviceLostRequests: req lost seqNo=%d req=<%s>", req->seqNo, UTSTRBUF_STR(req->request));
 
 	if(req->reqType == HSP_REQTYPE_CONTAINERS) {
 	  // nothing to do here - another will be sent at the RECHECK time
@@ -2061,7 +2060,7 @@ extern "C" {
 	      inspectContainer(mod, container);
 	    }
 	    else {
-	      myDebug(1, "docker unexpected request type=%d", req->reqType);
+	      EVDebug(mod, 1, "unexpected request type=%d", req->reqType);
 	    }
 	  }
 	}
@@ -2086,14 +2085,14 @@ extern "C" {
     case EVSOCKETREAD_AGAIN:
       break;
     case EVSOCKETREAD_STR:
-      myDebug(1, "new string for request seqNo=%d=<%s>", req->seqNo, UTSTRBUF_STR(req->request));
+      EVDebug(mod, 1, "new string for request seqNo=%d=<%s>", req->seqNo, UTSTRBUF_STR(req->request));
       if(!mdata->dockerFlush) {
 	processDockerResponse(mod, sock, req);
 	UTStrBuf_reset(sock->ioline);
       }
       break;
     case EVSOCKETREAD_EOF:
-      myDebug(1, "EOF for request seqNo=%d=<%s>", req->seqNo, UTSTRBUF_STR(req->request));
+      EVDebug(mod, 1, "EOF for request seqNo=%d=<%s>", req->seqNo, UTSTRBUF_STR(req->request));
       if(!mdata->dockerFlush) {
 	if(req->response)
 	  processDockerJSON(mod, req, req->response);
@@ -2102,7 +2101,7 @@ extern "C" {
     case EVSOCKETREAD_BADF:
     case EVSOCKETREAD_ERR:
       // clean up
-      myDebug(1, "request done seqNo=%d=<%s>", req->seqNo, UTSTRBUF_STR(req->request));
+      EVDebug(mod, 1, "request done seqNo=%d=<%s>", req->seqNo, UTSTRBUF_STR(req->request));
 
       if(req->reqType == HSP_REQTYPE_EVENTS) {
 	// we lost the event feed - need to flush and resync
@@ -2145,7 +2144,7 @@ extern "C" {
     char *cmd = UTSTRBUF_STR(req->request);
     ssize_t len = UTSTRBUF_LEN(req->request);
     int fd = UTUnixDomainSocket(HSP_DOCKER_SOCK);
-    myDebug(1, "dockerAPIRequest(%s) seqNo=%d, fd==%d", cmd, req->seqNo, fd);
+    EVDebug(mod, 1, "dockerAPIRequest(%s) seqNo=%d, fd==%d", cmd, req->seqNo, fd);
     if(fd < 0)  {
       // looks like docker was stopped
       // wait longer before retrying
@@ -2195,18 +2194,16 @@ extern "C" {
   static void dockerClearAll(EVMod *mod) {
     HSP_mod_DOCKER *mdata = (HSP_mod_DOCKER *)mod->data;
     // clear everything out:
-    // 1. pollActions
-    UTHashReset(mdata->pollActions);
-    // 2. containers
+    // 1. containers
     HSPVMState_DOCKER *container;
     UTHASH_WALK(mdata->vmsByID, container)
       removeAndFreeVM_DOCKER(mod, container);
-    // 3. event queue
+    // 2. event queue
     UTStrBuf *qbuf;
     UTARRAY_WALK(mdata->eventQueue, qbuf)
       UTStrBuf_free(qbuf);
     UTArrayReset(mdata->eventQueue);
-    // 4. request queue
+    // 3. request queue
     HSPDockerRequest *req, *nx;
     for(req = mdata->requestQ.head; req; ) {
       nx = req->next;
@@ -2216,7 +2213,7 @@ extern "C" {
     UTQ_CLEAR(mdata->requestQ);
     mdata->queuedRequests = 0;
 #ifdef HSP_DOCKER_WAITQ
-    // 5. wait queue
+    // 4. wait queue
     for(req = mdata->waitQ.head; req; ) {
       nx = req->next;
       dockerRequestFree(mod, req);
@@ -2225,7 +2222,7 @@ extern "C" {
     UTQ_CLEAR(mdata->waitQ);
     mdata->waitingRequests = 0;
 #endif
-    // 6. reqsBySeqNo
+    // 5. reqsBySeqNo
     // could now have dangling pointers to freed requests,
     // so only safe thing to do is wipe it and risk leaking some memory. Although
     // that would only happen if there were any requests outstanding that the engine
@@ -2266,63 +2263,59 @@ extern "C" {
     Packet Bus
   */
 
-  static void evt_flow_sample(EVMod *mod, EVEvent *evt, void *data, size_t dataLen) {
+  static bool containerDSByIP(EVMod *mod, SFLAddress *ipAddr) {
     HSP_mod_DOCKER *mdata = (HSP_mod_DOCKER *)mod->data;
-    HSPPendingSample *ps = (HSPPendingSample *)data;
-    int ip_ver = decodePendingSample(ps);
-    int ip_offset = 0;
-    switch(mdata->vnicLayer) {
-    case HSP_VNIC_LAYER_IP:
-      if(ip_ver == 4
-	 && ps->l3_offset)
-	ip_offset = ps->l3_offset;
-      break;
-    case HSP_VNIC_LAYER_IPIP:
-      if(ip_ver == 4
-	 && ps->ipproto == 4 // IP-over-IP
-	 && ps->l4_offset)
-	ip_offset = ps->l4_offset;
-      break;
-    default:
-      break;
+    HSPVNIC search = { };
+    search.ipAddr = *ipAddr;
+    HSPVNIC *vnic = UTHashGet(mdata->vnicByIP, &search);
+    if(vnic
+       && vnic->unique) {
+      EVDebug(mod, 1, "VNIC: got src %s (ds=%u)\n", vnic->c_name, vnic->dsIndex);
+      return vnic->dsIndex;
     }
-    if(ip_offset) {
-      uint32_t src_dsIndex=0, dst_dsIndex=0;
-      HSPVNIC search = { };
-      HSPVNIC *vnic;
-      search.ipAddr.type = SFLADDRESSTYPE_IP_V4;
-      memcpy(&search.ipAddr.address.ip_v4.addr, ps->hdr + ip_offset + 12, 4);
-      if(getDebug() > 2) {
-	char ipStr[64];
-	SFLAddress_print(&search.ipAddr, ipStr, 64);
-	myDebug(1, "VNIC: test src IP %s\n", ipStr);
-      }
-      vnic = UTHashGet(mdata->vnicByIP, &search);
-      if(vnic
-	 && vnic->unique) {
-	src_dsIndex = vnic->dsIndex;
-	myDebug(1, "VNIC: got %s (ds=%u)\n", vnic->c_name, vnic->dsIndex);
-      }
-      memcpy(&search.ipAddr.address.ip_v4.addr, ps->hdr + ip_offset + 16, 4);
-      if(getDebug() > 2) {
-	char ipStr[64];
-	SFLAddress_print(&search.ipAddr, ipStr, 64);
-	myDebug(1, "VNIC: test dst IP %s\n", ipStr);
-      }
-      vnic = UTHashGet(mdata->vnicByIP, &search);
-      if(vnic
-	 && vnic->unique) {
-	dst_dsIndex = vnic->dsIndex;
-	myDebug(1, "VNIC: got %s (ds=%u)\n", vnic->c_name, vnic->dsIndex);
-      }
+    return 0;
+  }
+  
+  static bool lookupContainerDS(EVMod *mod, HSPPendingSample *ps, uint32_t *p_src_dsIndex, uint32_t *p_dst_dsIndex) {
+    if(ps->gotInnerMAC) {
+      HSP *sp = (HSP *)EVROOTDATA(mod);
+      SFLAdaptor *src_vnic = adaptorByMac(sp, &ps->macsrc_1);
+      SFLAdaptor *dst_vnic = adaptorByMac(sp, &ps->macdst_1);
+      if(src_vnic)
+	*p_src_dsIndex = ADAPTOR_NIO(src_vnic)->container_dsIndex;
+      if(dst_vnic)
+	*p_dst_dsIndex = ADAPTOR_NIO(dst_vnic)->container_dsIndex;
+      return YES;
+    }
+    else if(ps->gotInnerIP) {
+      *p_src_dsIndex = containerDSByIP(mod, &ps->src_1);
+      *p_dst_dsIndex = containerDSByIP(mod, &ps->dst_1);
+      return YES;
+    }
+    else if(ps->l3_offset) {
+      *p_src_dsIndex = containerDSByIP(mod, &ps->src);
+      *p_dst_dsIndex = containerDSByIP(mod, &ps->dst);
+      return YES;
+    }
+    return NO;
+  }
+  
+  static void evt_flow_sample(EVMod *mod, EVEvent *evt, void *data, size_t dataLen) {
+    // HSP_mod_CONTAINERD *mdata = (HSP_mod_CONTAINERD *)mod->data;
+    HSPPendingSample *ps = (HSPPendingSample *)data;
+    decodePendingSample(ps);
+    uint32_t src_dsIndex=0, dst_dsIndex=0;
+    if(lookupContainerDS(mod, ps, &src_dsIndex, &dst_dsIndex)) {
       if(src_dsIndex || dst_dsIndex) {
 	SFLFlow_sample_element *entElem = pendingSample_calloc(ps, sizeof(SFLFlow_sample_element));
 	entElem->tag = SFLFLOW_EX_ENTITIES;
-	if(src_dsIndex) {
+	if(src_dsIndex
+	   && src_dsIndex != 0xFFFFFFFF) {
 	  entElem->flowType.entities.src_dsClass = SFL_DSCLASS_LOGICAL_ENTITY;
 	  entElem->flowType.entities.src_dsIndex = src_dsIndex;
 	}
-	if(dst_dsIndex) {
+	if(dst_dsIndex
+	   && dst_dsIndex != 0xFFFFFFFF) {
 	  entElem->flowType.entities.dst_dsClass = SFL_DSCLASS_LOGICAL_ENTITY;
 	  entElem->flowType.entities.dst_dsIndex = dst_dsIndex;
 	}
@@ -2352,7 +2345,6 @@ extern "C" {
     mdata->vmsByID = UTHASH_NEW(HSPVMState_DOCKER, id, UTHASH_SKEY);
     mdata->nameCount = UTHASH_NEW(HSPDockerNameCount, name, UTHASH_SKEY);
     mdata->hostnameCount = UTHASH_NEW(HSPDockerNameCount, name, UTHASH_SKEY);
-    mdata->pollActions = UTHASH_NEW(HSPVMState_DOCKER, id, UTHASH_IDTY);
     mdata->eventQueue = UTArrayNew(UTARRAY_DFLT);
     mdata->cgroupPathIdx = -1;
     mdata->reqsBySeqNo = UTHASH_NEW(HSPDockerRequest, seqNo, UTHASH_DFLT);
@@ -2360,7 +2352,6 @@ extern "C" {
     // register call-backs
     mdata->pollBus = EVGetBus(mod, HSPBUS_POLL, YES);
     EVEventRx(mod, EVGetEvent(mdata->pollBus, EVEVENT_TICK), evt_tick);
-    EVEventRx(mod, EVGetEvent(mdata->pollBus, EVEVENT_TOCK), evt_tock);
     EVEventRx(mod, EVGetEvent(mdata->pollBus, HSPEVENT_HOST_COUNTER_SAMPLE), evt_host_cs);
     EVEventRx(mod, EVGetEvent(mdata->pollBus, HSPEVENT_CONFIG_FIRST), evt_config_first);
 
@@ -2368,11 +2359,10 @@ extern "C" {
       EVBus *packetBus = EVGetBus(mod, HSPBUS_PACKET, YES);
       EVEventRx(mod, EVGetEvent(packetBus, HSPEVENT_FLOW_SAMPLE), evt_flow_sample);
       mdata->vnicByIP = UTHASH_NEW(HSPVNIC, ipAddr, UTHASH_SYNC); // need sync (poll + packet thread)
-      mdata->vnicLayer = HSP_VNIC_LAYER_IPIP; // TODO: make config parameter
 
       // learn my own namespace inode from /proc/self/ns/net
       if(stat("/proc/self/ns/net", &mdata->myNS) == 0)
-	myDebug(1, "my namespace dev.inode == %u.%u",
+	EVDebug(mod, 1, "my namespace dev.inode == %u.%u",
 		mdata->myNS.st_dev,
 		mdata->myNS.st_ino);
     }

@@ -6,10 +6,13 @@
 extern "C" {
 #endif
 
+#include <stdio.h>
 #include "util.h"
 
   static int debugLevel = 0;
   static bool daemonFlag = YES;
+  static FILE *debugOut = NULL;
+  static long debugLimit = 0;
 
   /*________________---------------------------__________________
     ________________       UTStrBuf            __________________
@@ -129,22 +132,53 @@ extern "C" {
     -----------------___________________________------------------
   */
 
-  void myLogv(int syslogType, char *fmt, va_list args)
-  {
-    if(debugLevel
+  void setDebugOut(FILE *out) {
+    debugOut = out;
+  }
+
+  FILE *getDebugOut(void) {
+    return debugOut ?: stdout;
+  }
+
+  void setDebugLimit(long byteLimit) {
+    debugLimit = byteLimit;
+  }
+
+  long getDebugLimit(void) {
+    return debugLimit;
+  }
+
+  void myLogv2(int level, bool end, int syslogType, char *fmt, va_list args) {
+    if(level
        || daemonFlag==NO) {
-      vfprintf(stdout, fmt, args);
-      fprintf(stdout, "\n");
+      FILE *out = getDebugOut();
+      if(debugLimit == 0
+	 || (ftell(out) < debugLimit)) {
+	vfprintf(out, fmt, args);
+	if(end)
+	  fprintf(out, "\n");
+      }
     }
     else
       vsyslog(syslogType, fmt, args);
   }
 
+  void myLogv(int syslogType, char *fmt, va_list args) {
+    myLogv2(debugLevel, YES, syslogType, fmt, args);
+  }
+
+  void myLog2(int level, bool end, int syslogType, char *fmt, ...)
+  {
+    va_list args;
+    va_start(args, fmt);
+    myLogv2(level, end, syslogType, fmt, args);
+  }
+    
   void myLog(int syslogType, char *fmt, ...)
   {
     va_list args;
     va_start(args, fmt);
-    myLogv(syslogType, fmt, args);
+    myLogv2(debugLevel, YES, syslogType, fmt, args);
   }
 
   void setDebug(int level) {
@@ -162,11 +196,10 @@ extern "C" {
   void myDebug(int level, char *fmt, ...)
   {
     if(debug(level)) {
+      myLog2(level, NO, LOG_DEBUG, "dbg%d:", level);
       va_list args;
       va_start(args, fmt);
-      fprintf(stdout, "dbg%d: ", level);
-      vfprintf(stdout, fmt, args);
-      fprintf(stdout, "\n");
+      myLogv2(level, YES, LOG_DEBUG, fmt, args);
     }
   }
 
@@ -192,7 +225,6 @@ extern "C" {
     void *mem = SYS_CALLOC(1, bytes);
     if(mem == NULL) {
       myLog(LOG_ERR, "calloc() failed : %s", strerror(errno));
-      if(debug(1)) malloc_stats();
       exit(EXIT_FAILURE);
     }
     return mem;
@@ -206,7 +238,6 @@ extern "C" {
     void *mem = SYS_REALLOC(ptr, bytes);
     if(mem == NULL) {
       myLog(LOG_ERR, "realloc() failed : %s", strerror(errno));
-      if(debug(1)) malloc_stats();
       exit(EXIT_FAILURE);
     }
     return mem;
@@ -523,7 +554,7 @@ extern "C" {
     while(isspace(*str)) {
       // also return NULL for a string with only spaces in it
       // (don't want that condition to slip through unnoticed)
-      if(++str >= end)
+      if(++str > end)
 	return NULL;
     }
 
@@ -657,6 +688,10 @@ extern "C" {
     return -1;
   }
 
+  bool strArrayContains(UTStringArray *ar, char *str) {
+    return (strArrayIndexOf(ar, str) >= 0);
+  }
+
   static int isSeparator(char ch, char *separators) {
     if(separators == NULL) return NO;
     for(char *sep = separators; (*sep) != '\0'; sep++)
@@ -781,8 +816,13 @@ extern "C" {
   static void arrayDeleteCheck(UTArray *ar) {
     ar->dbins++;
     if(ar->options & UTARRAY_PACK
-       && ar->n > 8
-       && ar->dbins > (ar->n >> 1))
+       // used to have more efficient "lazy" pack like this:
+       // && ar->n > 8
+       // && ar->dbins > (ar->n >> 1)
+       // but it's easier if UTARRAY_PACK means "always packed"
+       // because less likely to be thrown off by "holes" in
+       // the array.  Can revist if efficiency is neeeded.
+       )
       UTArrayPack(ar);
   }
     
@@ -1211,6 +1251,8 @@ extern "C" {
     ----------------___________________________------------------
   */
 
+  static __thread int th_n_adaptors=0;
+  
   SFLAdaptor *adaptorNew(char *dev, u_char *macBytes, size_t userDataSize, uint32_t ifIndex) {
     SFLAdaptor *ad = (SFLAdaptor *)my_calloc(sizeof(SFLAdaptor));
     ad->deviceName = my_strdup(dev);
@@ -1220,6 +1262,7 @@ extern "C" {
       memcpy(ad->macs[0].mac, macBytes, 6);
       ad->num_macs = 1;
     }
+    th_n_adaptors++;
     return ad;
   }
 
@@ -1239,7 +1282,12 @@ extern "C" {
       if(ad->deviceName) my_free(ad->deviceName);
       if(ad->userData) my_free(ad->userData);
       my_free(ad);
+      th_n_adaptors--;
     }
+  }
+
+  int adaptorInstances(void) {
+    return th_n_adaptors;
   }
 
   /*________________---------------------------__________________
@@ -1274,10 +1322,23 @@ extern "C" {
     my_free(adList);
   }
 
+  void markAdaptor(SFLAdaptor *ad)  {
+    ad->marked |= SFLADAPTOR_MARK_DEL;
+  }
+
+  bool adaptorIsMarked(SFLAdaptor *ad)  {
+    return (ad->marked & SFLADAPTOR_MARK_DEL) == SFLADAPTOR_MARK_DEL;
+  }
+
+  void unmarkAdaptor(SFLAdaptor *ad)  {
+    ad->marked &= ~SFLADAPTOR_MARK_DEL;
+  }
+  
   void adaptorListMarkAll(SFLAdaptorList *adList)
   {
     SFLAdaptor *ad;
-    ADAPTORLIST_WALK(adList, ad) ad->marked = YES;
+    ADAPTORLIST_WALK(adList, ad)
+      markAdaptor(ad);
   }
 
   int adaptorListFreeMarked(SFLAdaptorList *adList)
@@ -1285,7 +1346,8 @@ extern "C" {
     uint32_t removed = 0;
     for(uint32_t i = 0; i < adList->num_adaptors; i++) {
       SFLAdaptor *ad = adList->adaptors[i];
-      if(ad && ad->marked) {
+      if(ad
+	 && adaptorIsMarked(ad)) {
 	adaptorFree(ad);
 	adList->adaptors[i] = NULL;
 	removed++;
@@ -1627,6 +1689,11 @@ extern "C" {
     return isAllZero(mac->mac, 6);
   }
 
+  char *SFLMacAddress_print(SFLMacAddress *addr, char *buf, size_t len) {
+    printHex(addr->mac, 6, (u_char *)buf, len, NO);
+    return buf;
+  }
+
   /*________________---------------------------__________________
     ________________        UTHash             __________________
     ----------------___________________________------------------
@@ -1801,6 +1868,29 @@ static uint32_t hashSearch(UTHash *oh, void *obj, void **found) {
     my_free(oh);
   }
 
+  // Cursor walk. Start from 0.
+  // Ordering will be scrambled if HT grows.
+  void *UTHashNext(UTHash *oh, uint32_t *pCursor) {
+    uint32_t csr = *pCursor;
+    // skip over NULLs and DBINS
+    while(csr < oh->cap
+	  && (oh->bins[csr] == UTHASH_DBIN
+	      || oh->bins[csr] == NULL))
+      csr++;
+    // check for end (can also be off-end if HT was reset)
+    if(csr >= oh->cap) {
+      // don't advance cursor any further
+      *pCursor = csr;
+      return NULL;
+    }
+    else {
+      void *obj = oh->bins[csr];
+      // advance cursor
+      *pCursor = csr + 1;
+      return obj;
+    }
+  }
+  
   /*_________________---------------------------__________________
     _________________   socket handling         __________________
     -----------------___________________________------------------
@@ -1899,7 +1989,9 @@ static uint32_t hashSearch(UTHash *oh, void *obj, void **found) {
     addr.sun_family = AF_UNIX;
     strncpy(addr.sun_path, path, sizeof(addr.sun_path)-1);
     if(connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == -1) {
-      myLog(LOG_ERR, "UTUnixDomainSocket - connect() failed: %s", strerror(errno));
+      myLog(LOG_ERR, "UTUnixDomainSocket(%s) - connect() failed: %s",
+	    path,
+	    strerror(errno));
       close(fd);
       return -1;
     }
@@ -1937,12 +2029,14 @@ static uint32_t hashSearch(UTHash *oh, void *obj, void **found) {
   }
 
   int UTRegexExtractInt(regex_t *rx, char *str, int nvals, int *val1, int *val2, int *val3) {
-    assert(nvals > 0 && nvals <= 3);
     regmatch_t valMatch[4];
     if(regexec(rx, str, nvals+1, valMatch, 0) == 0) {
-      if(nvals >= 1) *val1 = extract_int(str, valMatch[1].rm_so, valMatch[1].rm_eo);
-      if(nvals >= 2) *val2 = extract_int(str, valMatch[2].rm_so, valMatch[2].rm_eo);
-      if(nvals >= 3) *val3 = extract_int(str, valMatch[3].rm_so, valMatch[3].rm_eo);
+      if(val1
+	 && nvals >= 1) *val1 = extract_int(str, valMatch[1].rm_so, valMatch[1].rm_eo);
+      if(val2
+	 && nvals >= 2) *val2 = extract_int(str, valMatch[2].rm_so, valMatch[2].rm_eo);
+      if(val3
+	 && nvals >= 3) *val3 = extract_int(str, valMatch[3].rm_so, valMatch[3].rm_eo);
       return YES;
     }
     return NO;

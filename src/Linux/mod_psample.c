@@ -21,8 +21,10 @@ extern "C" {
 #define SOL_NETLINK 270
 #endif
 
-#define HSP_PSAMPLE_READNL_RCV_BUF 8192
-#define HSP_PSAMPLE_READNL_BATCH 100
+#define HSP_PSAMPLE_READNL_RCV_BUF 16384
+#define HSP_PSAMPLE_RCVMSG_CBUFLEN 256
+#define HSP_PSAMPLE_READNL_BATCH 10
+#define HSP_PSAMPLE_MM_BATCH 8
 #define HSP_PSAMPLE_RCVBUF 8000000
 
   // Shadow the attributes in linux/psample.h so
@@ -62,6 +64,7 @@ extern "C" {
   typedef struct _HSP_mod_PSAMPLE {
     EnumPsampleState state;
     EVBus *packetBus;
+    EVEvent *psampleEvent;
     bool psample_configured;
     int nl_sock;
     uint32_t nl_seq;
@@ -74,6 +77,11 @@ extern "C" {
     uint32_t grp_ingress;
     uint32_t grp_egress;
     uint32_t last_grp_seq[2];
+    struct mmsghdr mmsgheader[HSP_PSAMPLE_MM_BATCH];
+    struct iovec iov[HSP_PSAMPLE_MM_BATCH];
+    char controlbuf[HSP_PSAMPLE_MM_BATCH][HSP_PSAMPLE_RCVMSG_CBUFLEN];
+    UTSockAddr peer[HSP_PSAMPLE_MM_BATCH];
+    char msgbuf[HSP_PSAMPLE_MM_BATCH][HSP_PSAMPLE_READNL_RCV_BUF];
   } HSP_mod_PSAMPLE;
 
   /*_________________---------------------------__________________
@@ -84,7 +92,7 @@ extern "C" {
   static void getFamily_PSAMPLE(EVMod *mod)
   {
     HSP_mod_PSAMPLE *mdata = (HSP_mod_PSAMPLE *)mod->data;
-    myDebug(1, "psample: getFamily");
+    EVDebug(mod, 1, "getFamily");
     mdata->state = HSP_PSAMPLE_STATE_GET_FAMILY;
     UTNLGeneric_send(mdata->nl_sock,
 		     mod->id,
@@ -104,7 +112,7 @@ extern "C" {
   static void joinGroup_PSAMPLE(EVMod *mod)
   {
     HSP_mod_PSAMPLE *mdata = (HSP_mod_PSAMPLE *)mod->data;
-    myDebug(1, "psample: joinGroup");
+    EVDebug(mod, 1, "joinGroup");
     mdata->state = HSP_PSAMPLE_STATE_JOIN_GROUP;
     // register for the multicast group_id
     if(setsockopt(mdata->nl_sock,
@@ -129,7 +137,7 @@ extern "C" {
     char *msg = (char *)NLMSG_DATA(nlh);
     int msglen = nlh->nlmsg_len - NLMSG_HDRLEN;
     struct genlmsghdr *genl = (struct genlmsghdr *)msg;
-    myDebug(1, "generic netlink CMD = %u", genl->cmd);
+    EVDebug(mod, 1, "generic netlink CMD = %u", genl->cmd);
 
     for(int offset = GENL_HDRLEN; offset < msglen; ) {
       struct nlattr *attr = (struct nlattr *)(msg + offset);
@@ -145,10 +153,10 @@ extern "C" {
 	break;
       case CTRL_ATTR_FAMILY_ID:
 	mdata->family_id = *(uint16_t *)attr_datap;
-	myDebug(1, "generic family id: %u", mdata->family_id); 
+	EVDebug(mod, 1, "generic family id: %u", mdata->family_id); 
 	break;
       case CTRL_ATTR_FAMILY_NAME:
-	myDebug(1, "generic family name: %s", attr_datap); 
+	EVDebug(mod, 1, "generic family name: %s", attr_datap); 
 	break;
       case CTRL_ATTR_MCAST_GROUPS:
 	for(int grp_offset = NLA_HDRLEN; grp_offset < attr->nla_len;) {
@@ -171,11 +179,11 @@ extern "C" {
 	    switch(gf_attr->nla_type) {
 	    case CTRL_ATTR_MCAST_GRP_NAME:
 	      grp_name = grp_attr_datap;
-	      myDebug(1, "psample multicast group: %s", grp_name); 
+	      EVDebug(mod, 1, "psample multicast group: %s", grp_name); 
 	      break;
 	    case CTRL_ATTR_MCAST_GRP_ID:
 	      grp_id = *(uint32_t *)grp_attr_datap;
-	      myDebug(1, "psample multicast group id: %u", grp_id); 
+	      EVDebug(mod, 1, "psample multicast group id: %u", grp_id); 
 	      break;
 	    }
 	    gf_offset += NLMSG_ALIGN(gf_attr->nla_len);
@@ -184,7 +192,7 @@ extern "C" {
 	     && grp_name
 	     && grp_id
 	     && my_strequal(grp_name, PSAMPLE_NL_MCGRP_SAMPLE_NAME)) {
-	    myDebug(1, "psample found group %s=%u", grp_name, grp_id);
+	    EVDebug(mod, 1, "psample found group %s=%u", grp_name, grp_id);
 	    mdata->group_id = grp_id;
 	    joinGroup_PSAMPLE(mod);
 	  }
@@ -193,7 +201,7 @@ extern "C" {
 	}
 	break;
       default:
-	myDebug(1, "psample attr type: %u (nested=%u) len: %u",
+	EVDebug(mod, 1, "psample attr type: %u (nested=%u) len: %u",
 		attr->nla_type,
 		attr->nla_type & NLA_F_NESTED,
 		attr->nla_len);
@@ -223,14 +231,9 @@ extern "C" {
     u_char *msg = (u_char *)NLMSG_DATA(nlh);
     int msglen = nlh->nlmsg_len - NLMSG_HDRLEN;
     struct genlmsghdr *genl = (struct genlmsghdr *)msg;
-    myDebug(1, "psample netlink (type=%u) CMD = %u", nlh->nlmsg_type, genl->cmd);
+    EVDebug(mod, 2, "psample netlink (type=%u) CMD = %u", nlh->nlmsg_type, genl->cmd);
 
-    uint16_t ifin=0,ifout=0;
-    uint32_t pkt_len=0;
-    uint32_t grp_no=0;
-    uint32_t grp_seq=0;
-    uint32_t sample_n=0;
-    u_char *pkt=NULL;
+    HSPPSample psmp = {};
     SFLFlow_sample_element *ext_elems = NULL;
     // TODO: tunnel encap/decap may be avaiable too
 
@@ -241,22 +244,28 @@ extern "C" {
 	myLog(LOG_ERR, "processNetlink_PSAMPLE attr parse error");
 	break;
       }
-      u_char *datap = msg + offset + NLA_HDRLEN;
+      u_char *datap = UTNLA_DATA(ps_attr);
+      int datalen = UTNLA_PAYLOAD(ps_attr);
+
       switch(ps_attr->nla_type) {
 	// TODO: interpret PSAMPLE_ATTR_PROTO
-      case PSAMPLE_ATTR_IIFINDEX: ifin = *(uint16_t *)datap; break;
-      case PSAMPLE_ATTR_OIFINDEX: ifout = *(uint16_t *)datap; break;
-      case PSAMPLE_ATTR_ORIGSIZE: pkt_len = *(uint32_t *)datap; break;
-      case PSAMPLE_ATTR_SAMPLE_GROUP: grp_no = *(uint32_t *)datap; break;
-      case PSAMPLE_ATTR_GROUP_SEQ: grp_seq = *(uint32_t *)datap; break;
-      case PSAMPLE_ATTR_SAMPLE_RATE: sample_n = *(uint32_t *)datap; break;
-      case PSAMPLE_ATTR_DATA: pkt = datap; break;
+      case PSAMPLE_ATTR_IIFINDEX: psmp.ifin = *(uint16_t *)datap; break;
+      case PSAMPLE_ATTR_OIFINDEX: psmp.ifout = *(uint16_t *)datap; break;
+      case PSAMPLE_ATTR_ORIGSIZE: psmp.pkt_len = *(uint32_t *)datap; break;
+      case PSAMPLE_ATTR_SAMPLE_GROUP: psmp.grp_no = *(uint32_t *)datap; break;
+      case PSAMPLE_ATTR_GROUP_SEQ: psmp.grp_seq = *(uint32_t *)datap; break;
+      case PSAMPLE_ATTR_SAMPLE_RATE: psmp.sample_n = *(uint32_t *)datap; break;
+      case PSAMPLE_ATTR_DATA:
+	psmp.hdr = datap;
+	psmp.hdr_len = datalen;
+	break;
       case HSP_PSAMPLE_ATTR_OUT_TC:
 	{
 	  // queue id
 	  SFLFlow_sample_element *egress_Q = my_calloc(sizeof(SFLFlow_sample_element));
 	  egress_Q->tag = SFLFLOW_EX_EGRESS_Q;
-	  egress_Q->flowType.egress_queue.queue = *(uint16_t *)datap;
+	  psmp.egressQ_id = *(uint16_t *)datap;
+	  egress_Q->flowType.egress_queue.queue = psmp.egressQ_id;
 	  ADD_TO_LIST(ext_elems, egress_Q);
 	}
 	break;
@@ -265,7 +274,8 @@ extern "C" {
 	  // queue occupancy (bytes)
 	  SFLFlow_sample_element *Q_depth = my_calloc(sizeof(SFLFlow_sample_element));
 	  Q_depth->tag = SFLFLOW_EX_Q_DEPTH;
-	  Q_depth->flowType.queue_depth.depth = *(uint64_t *)datap; // Will take lo 32-bits
+	  psmp.egressQ_byts = *(uint64_t *)datap;
+	  Q_depth->flowType.queue_depth.depth = psmp.egressQ_byts; // Will take lo 32-bits
 	  ADD_TO_LIST(ext_elems, Q_depth);
 	}
 	break;
@@ -274,7 +284,8 @@ extern "C" {
 	  // transit latency (nS)
 	  SFLFlow_sample_element *transit = my_calloc(sizeof(SFLFlow_sample_element));
 	  transit->tag = SFLFLOW_EX_TRANSIT;
-	  transit->flowType.transit_delay.delay = *(uint64_t *)datap; // Will take lo 32-bits
+	  psmp.transit_nS = *(uint64_t *)datap;
+	  transit->flowType.transit_delay.delay = psmp.transit_nS; // Will take lo 32-bits
 	  ADD_TO_LIST(ext_elems, transit);
 	}
 	break;
@@ -290,35 +301,44 @@ extern "C" {
       uint64_t transitDelay = 33333L;
       SFLFlow_sample_element *egress_Q = my_calloc(sizeof(SFLFlow_sample_element));
       egress_Q->tag = SFLFLOW_EX_EGRESS_Q;
-      egress_Q->flowType.egress_queue.queue = *(uint16_t *)(&queueIdx);
+      psmp.egressQ_id = *(uint16_t *)(&queueIdx);
+      egress_Q->flowType.egress_queue.queue = psmp.egressQ_id;
       ADD_TO_LIST(ext_elems, egress_Q);
       // queue occupancy (bytes)
       SFLFlow_sample_element *Q_depth = my_calloc(sizeof(SFLFlow_sample_element));
       Q_depth->tag = SFLFLOW_EX_Q_DEPTH;
-      Q_depth->flowType.queue_depth.depth = *(uint64_t *)(&queueDepth); // Will take lo 32-bits
+      psmp.egressQ_byts = *(uint64_t *)(&queueDepth);
+      Q_depth->flowType.queue_depth.depth = psmp.egressQ_byts; // Will take lo 32-bits
       ADD_TO_LIST(ext_elems, Q_depth);
       // transit latency (nS)
       SFLFlow_sample_element *transit = my_calloc(sizeof(SFLFlow_sample_element));
       transit->tag = SFLFLOW_EX_TRANSIT;
-      transit->flowType.transit_delay.delay = *(uint64_t *)(&transitDelay); // Will take lo 32-bits
+      psmp.egressQ_nS = *(uint64_t *)(&transitDelay);
+      transit->flowType.transit_delay.delay = psmp.egressQ_nS; // Will take lo 32-bits
       ADD_TO_LIST(ext_elems, transit);
     }
 #endif
 
-    myDebug(3, "psample: grp=%u", grp_no);
+    EVDebug(mod, 3, "grp=%u", psmp.grp_no);
 
+    // share on bus
+    // TOOD: consider having all the packet-sampling modules
+    // do this, then only call "takeSample()" in one place?
+    EVEventTx(mod, mdata->psampleEvent, &psmp, sizeof(psmp));
+    
     // TODO: this filter can be pushed into kernel with BPF expression on socket
     // but that might affect control messages?  For now it seems unlikely that
     // doing the fitering here will be catastophic, but we can always revisit.
-    if(grp_no
-       && (grp_no == mdata->grp_ingress
-	   || grp_no == mdata->grp_egress)
-       && pkt
-       && pkt_len
-       && sample_n) {
+    if(psmp.grp_no
+       && (psmp.grp_no == mdata->grp_ingress
+	   || psmp.grp_no == mdata->grp_egress)
+       && psmp.hdr
+       && psmp.hdr_len
+       && psmp.pkt_len
+       && psmp.sample_n) {
       
       // index for grp data
-      int egress = (grp_no == mdata->grp_egress) ? 1 : 0;
+      int egress = (psmp.grp_no == mdata->grp_egress) ? 1 : 0;
 
       // confirmation that we have moved to state==run
       if(mdata->state == HSP_PSAMPLE_STATE_JOIN_GROUP)
@@ -326,27 +346,27 @@ extern "C" {
 
       uint32_t drops = 0;
       if(mdata->last_grp_seq[egress]) {
-	drops = grp_seq - mdata->last_grp_seq[egress] - 1;
+	drops = psmp.grp_seq - mdata->last_grp_seq[egress] - 1;
 	if(drops > 0x7FFFFFFF)
 	  drops = 1;
       }
-      mdata->last_grp_seq[egress] = grp_seq;
+      mdata->last_grp_seq[egress] = psmp.grp_seq;
 
-      myDebug(2, "psample: grp=%u in=%u out=%u n=%u seq=%u drops=%u pktlen=%u",
-	      grp_no,
-	      ifin,
-	      ifout,
-	      sample_n,
-	      grp_seq,
+      EVDebug(mod, 2, "grp=%u in=%u out=%u n=%u seq=%u drops=%u pktlen=%u",
+	      psmp.grp_no,
+	      psmp.ifin,
+	      psmp.ifout,
+	      psmp.sample_n,
+	      psmp.grp_seq,
 	      drops,
-	      pkt_len);
+	      psmp.pkt_len);
 
-      SFLAdaptor *inDev = adaptorByIndex(sp, ifin);
-      SFLAdaptor *outDev = adaptorByIndex(sp, ifout);
+      SFLAdaptor *inDev = adaptorByIndex(sp, psmp.ifin);
+      SFLAdaptor *outDev = adaptorByIndex(sp, psmp.ifout);
       SFLAdaptor *samplerDev = egress ? outDev : inDev;
       if(!samplerDev) {
         // handle startup race-condition where interface has not been discovered yet
-        myDebug(2, "psample: unknown ifindex %u (startup race-condition?)", ifin);
+        EVDebug(mod, 2, "unknown ifindex %u (startup race-condition?)", psmp.ifin);
 	freeExtendedElements(ext_elems);
         return;
       }
@@ -354,16 +374,21 @@ extern "C" {
       // See if the sample_n matches what we think was configured
       HSPAdaptorNIO *nio = ADAPTOR_NIO(samplerDev);
       bool takeIt = YES;
-      uint32_t this_sample_n = sample_n;
+      uint32_t this_sample_n = psmp.sample_n;
       
-      if(sample_n != nio->sampling_n) {
-	if(sample_n < nio->sampling_n) {
+      if(psmp.sample_n != nio->sampling_n) {
+
+	EVDebug(mod, 2, "psample sampling N (%u) != configured N (%u)",
+		psmp.sample_n,
+		nio->sampling_n);
+
+	if(psmp.sample_n < nio->sampling_n) {
 	  // apply sub-sampling on this interface.  We may get here if the
 	  // hardware or kernel is configured to sample at 1:N and then
 	  // hsflowd.conf or DNS-SD adjusts it to 1:M dynamically.  This
 	  // could be a legitimate use-case, especially if the same PSAMPLE
 	  // group is feeding more than one consumer.
-	  nio->subSampleCount += sample_n;
+	  nio->subSampleCount += psmp.sample_n;
 	  if(nio->subSampleCount >= nio->sampling_n) {
 	    this_sample_n = nio->subSampleCount;
 	    nio->subSampleCount = 0;
@@ -384,11 +409,11 @@ extern "C" {
 		   samplerDev,
 		   sp->psample.ds_options,
 		   0, // hook
-		   pkt, // mac hdr
+		   psmp.hdr, // mac hdr
 		   14, // mac hdr len
-		   pkt + 14, // payload
-		   pkt_len - 14, // captured payload len
-		   pkt_len - 14, // whole pdu len
+		   psmp.hdr + 14, // payload
+		   psmp.hdr_len - 14, // captured payload len
+		   psmp.pkt_len - 14, // whole pdu len
 		   drops,
 		   this_sample_n,
 		   ext_elems);
@@ -424,38 +449,69 @@ extern "C" {
   static void readNetlink_PSAMPLE(EVMod *mod, EVSocket *sock, void *magic)
   {
     HSP_mod_PSAMPLE *mdata = (HSP_mod_PSAMPLE *)mod->data;
-    uint8_t recv_buf[HSP_PSAMPLE_READNL_RCV_BUF];
+    
     int batch = 0;
     for( ; batch < HSP_PSAMPLE_READNL_BATCH; batch++) {
-      int numbytes = recv(sock->fd, recv_buf, sizeof(recv_buf), 0);
-      if(numbytes <= 0)
-	break;
-      struct nlmsghdr *nlh = (struct nlmsghdr*) recv_buf;
-      while(NLMSG_OK(nlh, numbytes)){
-	if(nlh->nlmsg_type == NLMSG_DONE)
-	  break;
-	if(nlh->nlmsg_type == NLMSG_ERROR){
-	  struct nlmsgerr *err_msg = (struct nlmsgerr *)NLMSG_DATA(nlh);
-	  if(err_msg->error == 0) {
-	    myDebug(1, "received Netlink ACK");
-	  }
-	  else {
-	    // TODO: parse NLMSGERR_ATTR_OFFS to get offset?  Might be helpful
-	    myDebug(1, "psample state %u: error in netlink message: %d : %s",
-		    mdata->state,
-		    err_msg->error,
-		    strerror(-err_msg->error));
-	  }
-	  break;
+
+      // wire up my packet buffers (may only
+      // need the msg_namelen to be reset every time)
+      for(uint32_t ii = 0; ii < HSP_PSAMPLE_MM_BATCH; ii++) {
+	struct msghdr *mh = &mdata->mmsgheader[ii].msg_hdr;
+	mh->msg_control = &mdata->controlbuf[ii];
+	mh->msg_controllen = HSP_PSAMPLE_RCVMSG_CBUFLEN;
+	mh->msg_name = &mdata->peer[ii];
+	mh->msg_namelen = sizeof(mdata->peer[ii]);
+	mh->msg_iov = &mdata->iov[ii];
+	mh->msg_iovlen = 1;
+	mh->msg_flags = 0;
+	mdata->iov[ii].iov_base = mdata->msgbuf[ii];;
+	mdata->iov[ii].iov_len = HSP_PSAMPLE_READNL_RCV_BUF;
+      }
+      int flags = 0;
+      struct timespec timeout = {};
+      int cc = recvmmsg(sock->fd, mdata->mmsgheader, HSP_PSAMPLE_MM_BATCH, flags, &timeout);
+      
+      if(cc > 1)
+	EVDebug(mod, 0, "recvmmsg got %u msgs\n", cc);
+      
+      if(cc <= 0) {
+	if(errno != EAGAIN) {
+	  myLog(LOG_ERR, "recvmmsg() failed, cc=%d, %s\n", cc, strerror(errno));
 	}
-	processNetlink(mod, nlh);
-	nlh = NLMSG_NEXT(nlh, numbytes);
+	return;
+      }
+      for(int ii = 0; ii < cc; ii++) {
+	struct mmsghdr *mm = &mdata->mmsgheader[ii];      
+	int numbytes = mm->msg_len;
+	if(numbytes > 0) {
+	  struct nlmsghdr *nlh = (struct nlmsghdr*) mdata->msgbuf[ii];
+	  while(NLMSG_OK(nlh, numbytes)){
+	    if(nlh->nlmsg_type == NLMSG_DONE)
+	      break;
+	    if(nlh->nlmsg_type == NLMSG_ERROR){
+	      struct nlmsgerr *err_msg = (struct nlmsgerr *)NLMSG_DATA(nlh);
+	      if(err_msg->error == 0) {
+		EVDebug(mod, 1, "received Netlink ACK");
+	      }
+	      else {
+		// TODO: parse NLMSGERR_ATTR_OFFS to get offset?  Might be helpful
+		EVDebug(mod, 1, "state %u: error in netlink message: %d : %s",
+			mdata->state,
+			err_msg->error,
+			strerror(-err_msg->error));
+	      }
+	      break;
+	    }
+	    processNetlink(mod, nlh);
+	    nlh = NLMSG_NEXT(nlh, numbytes);
+	  }
+	}
       }
     }
 
     // This should have advanced the state past GET_FAMILY
     if(mdata->state == HSP_PSAMPLE_STATE_GET_FAMILY) {
-      myDebug(1, "psample: failed to get family details - wait before trying again");
+      EVDebug(mod, 1, "failed to get family details - wait before trying again");
       mdata->state = HSP_PSAMPLE_STATE_WAIT;
       mdata->retry_countdown = HSP_PSAMPLE_WAIT_RETRY_S;
     }
@@ -545,7 +601,7 @@ extern "C" {
     mdata->packetBus = EVGetBus(mod, HSPBUS_PACKET, YES);
     EVEventRx(mod, EVGetEvent(mdata->packetBus, HSPEVENT_CONFIG_CHANGED), evt_config_changed);
     EVEventRx(mod, EVGetEvent(mdata->packetBus, EVEVENT_TICK), evt_tick);
-
+    mdata->psampleEvent = EVGetEvent(mdata->packetBus, HSPEVENT_PSAMPLE);
 
     // if ds_options not set, apply defaults for kernel/asic sampling where
     // we know the interface index of the sampling datasource because

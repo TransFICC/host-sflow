@@ -27,12 +27,6 @@ extern "C" {
 #define __STDC_FORMAT_MACROS
 #include <inttypes.h> // for PRIu64 etc.
 
-#ifdef __GLIBC__
-#include "malloc.h" // for malloc_stats()
-#else
-#define malloc_stats() {}
-#endif
-
 #include <sys/wait.h>
 #include <ctype.h> // for isspace() etc.
 #include "pthread.h"
@@ -71,8 +65,15 @@ extern "C" {
   // logger
   void myLogv(int syslogType, char *fmt, va_list args);
   void myLog(int syslogType, char *fmt, ...);
+  // expose composable logging calls too
+  void myLogv2(int level, bool end, int syslogType, char *fmt, va_list args);
+  void myLog2(int level, bool end, int syslogType, char *fmt, ...);
   void setDebug(int level);
   int getDebug(void);
+  void setDebugOut(FILE *out);
+  FILE *getDebugOut(void);
+  void setDebugLimit(long byteLimit);
+  long getDebugLimit(void);
   int debug(int level);
   void myDebug(int level, char *fmt, ...);
   void setDaemon(bool yesno);
@@ -184,6 +185,7 @@ extern "C" {
   char *strArrayStr(UTStringArray *ar, char *start, char *quote, char *delim, char *end);
   int strArrayEqual(UTStringArray *ar1, UTStringArray *ar2);
   int strArrayIndexOf(UTStringArray *ar, char *str);
+  bool strArrayContains(UTStringArray *ar, char *str);
 
   // obj array
   typedef struct _UTArray {
@@ -228,11 +230,17 @@ extern "C" {
   SFLAdaptor *adaptorNew(char *dev, u_char *macBytes, size_t userDataSize, uint32_t ifIndex);
   int adaptorEqual(SFLAdaptor *ad1, SFLAdaptor *ad2);
   void adaptorFree(SFLAdaptor *ad);
+  int adaptorInstances(void);
+
+  void markAdaptor(SFLAdaptor *ad);
+  bool adaptorIsMarked(SFLAdaptor *ad);
+  void unmarkAdaptor(SFLAdaptor *ad);
 
   // SFLAdaptorList
   SFLAdaptorList *adaptorListNew(void);
   void adaptorListReset(SFLAdaptorList *adList);
   void adaptorListFree(SFLAdaptorList *adList);
+#define SFLADAPTOR_MARK_DEL 0x80000000
   void adaptorListMarkAll(SFLAdaptorList *adList);
   int adaptorListFreeMarked(SFLAdaptorList *adList);
   SFLAdaptor *adaptorListGet(SFLAdaptorList *adList, char *dev);
@@ -245,6 +253,11 @@ extern "C" {
   int UTFileExists(char *path);
 
   // sockets
+  typedef union _UTSockAddr {
+    struct sockaddr_in v4;
+    struct sockaddr_in6 v6;
+  } UTSockAddr;
+
   void UTSocketRcvbuf(int fd, int requested);
   int UTSocketUDP(char *bindaddr, int family, uint16_t port, int bufferSize);
   int UTUnixDomainSocket(char *path);
@@ -266,6 +279,7 @@ extern "C" {
 
   int isAllZero(u_char *buf, int len);
   int isZeroMAC(SFLMacAddress *mac);
+  char *SFLMacAddress_print(SFLMacAddress *addr, char *buf, size_t len);
 
   // UTHash
   typedef struct _UTHash {
@@ -292,7 +306,8 @@ extern "C" {
   void *UTHashDel(UTHash *oh, void *obj);
   void *UTHashDelKey(UTHash *oh, void *obj);
   void UTHashReset(UTHash *oh);
-   uint32_t UTHashN(UTHash *oh);
+  uint32_t UTHashN(UTHash *oh);
+  void *UTHashNext(UTHash *oh, uint32_t *pCursor);
 
 #define UTHASH_DBIN (void *)-1
 

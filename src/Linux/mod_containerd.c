@@ -76,24 +76,17 @@ extern "C" {
     SFLAddress ipAddr;
     uint32_t dsIndex;
     char *c_name;
+    char *c_hostname;
     bool unique;
   } HSPVNIC;
 
 #define HSP_VNIC_REFRESH_TIMEOUT 300
 #define HSP_CGROUP_REFRESH_TIMEOUT 600
 
-  typedef enum {
-    HSP_VNIC_LAYER_NONE,
-    HSP_VNIC_LAYER_MAC,
-    HSP_VNIC_LAYER_IP,
-    HSP_VNIC_LAYER_IPIP
-  } EnumHSPVNICLayer;
-
   typedef struct _HSP_mod_CONTAINERD {
     EVBus *pollBus;
     UTHash *vmsByUUID;
     UTHash *vmsByID;
-    UTHash *pollActions;
     SFLCounters_sample_element vnodeElem;
     int cgroupPathIdx;
     UTHash *nameCount;
@@ -101,7 +94,6 @@ extern "C" {
     uint32_t dup_names;
     uint32_t dup_hostnames;
     struct stat myNS;
-    EnumHSPVNICLayer vnicLayer;
     UTHash *vnicByIP;
     uint32_t configRevisionNo;
     pid_t readerPid;
@@ -144,7 +136,7 @@ extern "C" {
   static int containerLinkCB(EVMod *mod, HSPVMState_CONTAINERD *container, char *line) {
     HSP_mod_CONTAINERD *mdata = (HSP_mod_CONTAINERD *)mod->data;
     HSP *sp = (HSP *)EVROOTDATA(mod);
-    myDebug(1, "containerLinkCB: line=<%s>", line);
+    EVDebug(mod, 1, "containerLinkCB: line=<%s>", line);
     char deviceName[HSP_CONTAINERD_MAX_LINELEN];
     char macStr[HSP_CONTAINERD_MAX_LINELEN];
     char ipStr[HSP_CONTAINERD_MAX_LINELEN];
@@ -154,7 +146,7 @@ extern "C" {
       if(hexToBinary((u_char *)macStr, mac, 6) == 6) {
 	SFLAdaptor *adaptor = adaptorListGet(container->vm.interfaces, deviceName);
 	if(adaptor == NULL) {
-	  adaptor = nioAdaptorNew(deviceName, mac, ifIndex);
+	  adaptor = nioAdaptorNew(mod, deviceName, mac, ifIndex);
 	  adaptorListAdd(container->vm.interfaces, adaptor);
 	  // add to "all namespaces" collections too - but only the ones where
 	  // the id is really global.  For example,  many containers can have
@@ -165,53 +157,71 @@ extern "C" {
 
 	  if(UTHashGet(sp->adaptorsByMac, adaptor) == NULL)
 	    if(UTHashAdd(sp->adaptorsByMac, adaptor) != NULL)
-	      myDebug(1, "Warning: container adaptor overwriting adaptorsByMac");
+	      EVDebug(mod, 1, "Warning: container adaptor overwriting adaptorsByMac");
 
 	  if(UTHashGet(sp->adaptorsByIndex, adaptor) == NULL)
 	    if(UTHashAdd(sp->adaptorsByIndex, adaptor) != NULL)
-	      myDebug(1, "Warning: container adaptor overwriting adaptorsByIndex");
+	      EVDebug(mod, 1, "Warning: container adaptor overwriting adaptorsByIndex");
+	}
+	else {
+	  // clear mark
+	  unmarkAdaptor(adaptor);
+	}
 
-	  // mark it as a vm/container device
-	  ADAPTOR_NIO(adaptor)->vm_or_container = YES;
-
-	  // did we get an ip address too?
-	  SFLAddress ipAddr = { };
-	  if(parseNumericAddress(ipStr, NULL, &ipAddr, AF_INET)) {
-	    if(!SFLAddress_isZero(&ipAddr)
-	       && mdata->vnicByIP) {
-	      myDebug(1, "VNIC: learned virtual ipAddr: %s", ipStr);
-	      // Can use this to associate traffic with this container
-	      // if this address appears in sampled packet header as
-	      // outer or inner IP
-	      ADAPTOR_NIO(adaptor)->ipAddr = ipAddr;
-	      HSPVNIC search = { .ipAddr = ipAddr };
-	      HSPVNIC *vnic = UTHashGet(mdata->vnicByIP, &search);
-	      if(vnic) {
-		// found IP - check for non-unique mapping
-		if(vnic->dsIndex != container->vm.dsIndex) {
-		  myDebug(1, "VNIC: clash between %s (ds=%u) and %s (ds=%u) -- setting unique=no",
-			  vnic->c_name,
-			  vnic->dsIndex,
-			  container->name,
-			  container->vm.dsIndex);
-		  vnic->unique = NO;
-		}
-	      }
-	      else {
-		// add new VNIC entry
-		vnic = (HSPVNIC *)my_calloc(sizeof(HSPVNIC));
-		vnic->ipAddr = ipAddr;
-		vnic->dsIndex = container->vm.dsIndex;
-		vnic->c_name = my_strdup(container->name);
-		UTHashAdd(mdata->vnicByIP, vnic);
-		vnic->unique = YES;
-		myDebug(1, "VNIC: linked to %s (ds=%u)",
-			vnic->c_name,
-			vnic->dsIndex);
+	// mark it as a vm/container device
+	// and record the dsIndex there for easy mapping later
+	// provided it is unique.  Otherwise set it to all-ones
+	// to indicate that it should not be used to map to container.
+	HSPAdaptorNIO *nio = ADAPTOR_NIO(adaptor);
+	nio->vm_or_container = YES;
+	if(nio->container_dsIndex != container->vm.dsIndex) {
+	  if(nio->container_dsIndex == 0)
+	    nio->container_dsIndex = container->vm.dsIndex;
+	  else {
+	    EVDebug(mod, 1, "Warning: NIC already claimed by container with dsIndex==nio->container_dsIndex");
+	    // mark is as not a unique mapping
+	    nio->container_dsIndex = 0xFFFFFFFF;
+	  }
+	}
+	
+	// did we get an ip address too?
+	SFLAddress ipAddr = { };
+	if(parseNumericAddress(ipStr, NULL, &ipAddr, PF_INET)) {
+	  if(!SFLAddress_isZero(&ipAddr)
+	     && mdata->vnicByIP) {
+	    EVDebug(mod, 1, "VNIC: learned virtual ipAddr: %s", ipStr);
+	    // Can use this to associate traffic with this container
+	    // if this address appears in sampled packet header as
+	    // outer or inner IP
+	    ADAPTOR_NIO(adaptor)->ipAddr = ipAddr;
+	    HSPVNIC search = { .ipAddr = ipAddr };
+	    HSPVNIC *vnic = UTHashGet(mdata->vnicByIP, &search);
+	    if(vnic) {
+	      // found IP - check for non-unique mapping
+	      if(vnic->dsIndex != container->vm.dsIndex) {
+		EVDebug(mod, 1, "VNIC: IP %s clash between %s (ds=%u) and %s (ds=%u) -- setting unique=no",
+			ipStr,
+			vnic->c_hostname,
+			vnic->dsIndex,
+			container->hostname,
+			container->vm.dsIndex);
+		vnic->unique = NO;
 	      }
 	    }
+	    else {
+	      // add new VNIC entry
+	      vnic = (HSPVNIC *)my_calloc(sizeof(HSPVNIC));
+	      vnic->ipAddr = ipAddr;
+	      vnic->dsIndex = container->vm.dsIndex;
+	      vnic->c_name = my_strdup(container->name);
+	      vnic->c_hostname = my_strdup(container->hostname);
+	      UTHashAdd(mdata->vnicByIP, vnic);
+	      vnic->unique = YES;
+	      EVDebug(mod, 1, "VNIC: linked to %s (ds=%u)",
+		      vnic->c_hostname,
+		      vnic->dsIndex);
+	    }
 	  }
-
 	}
       }
     }
@@ -238,7 +248,7 @@ extern "C" {
   int readContainerInterfaces(EVMod *mod, HSPVMState_CONTAINERD *container)  {
     HSP_mod_CONTAINERD *mdata = (HSP_mod_CONTAINERD *)mod->data;
     pid_t nspid = container->pid;
-    myDebug(2, "readContainerInterfaces: pid=%u", nspid);
+    EVDebug(mod, 2, "readContainerInterfaces: pid=%u", nspid);
     if(nspid == 0) return 0;
 
     // do the dirty work after a fork, so we can just exit afterwards,
@@ -271,10 +281,10 @@ extern "C" {
 
       struct stat statBuf;
       if(fstat(nsfd, &statBuf) == 0) {
-	myDebug(2, "container namespace dev.inode == %u.%u", statBuf.st_dev, statBuf.st_ino);
+	EVDebug(mod, 2, "container namespace dev.inode == %u.%u", statBuf.st_dev, statBuf.st_ino);
 	if(statBuf.st_dev == mdata->myNS.st_dev
 	   && statBuf.st_ino == mdata->myNS.st_ino) {
-	  myDebug(1, "skip my own namespace");
+	  EVDebug(mod, 1, "skip my own namespace");
 	  exit(0);
 	}
       }
@@ -332,7 +342,7 @@ extern "C" {
 		// ifIndex and MAC when looking at container interfaces
 		if(ioctl(fd,SIOCGIFINDEX, &ifr) < 0) {
 		  // only complain about this if we are debugging
-		  myDebug(1, "container device %s Get SIOCGIFINDEX failed : %s",
+		  EVDebug(mod, 1, "container device %s Get SIOCGIFINDEX failed : %s",
 			  devName,
 			  strerror(errno));
 		}
@@ -343,7 +353,7 @@ extern "C" {
 		  // see if we can get an IP address
 		  if(ioctl(fd,SIOCGIFADDR, &ifr) < 0) {
 		    // only complain about this if we are debugging
-		    myDebug(1, "device %s Get SIOCGIFADDR failed : %s",
+		    EVDebug(mod, 1, "device %s Get SIOCGIFADDR failed : %s",
 			    devName,
 			    strerror(errno));
 		  }
@@ -358,7 +368,7 @@ extern "C" {
 
 		  // Get the MAC Address for this interface
 		  if(ioctl(fd,SIOCGIFHWADDR, &ifr) < 0) {
-		    myDebug(1, "device %s Get SIOCGIFHWADDR failed : %s",
+		    EVDebug(mod, 1, "device %s Get SIOCGIFHWADDR failed : %s",
 			      devName,
 			      strerror(errno));
 		  }
@@ -481,20 +491,15 @@ extern "C" {
       sp->telemetry[HSP_TELEMETRY_COUNTER_SAMPLES_SUPPRESSED]++;
     }
     else {
-      SEMLOCK_DO(sp->sync_agent) {
-	sfl_poller_writeCountersSample(vm->poller, &cs);
-	sp->counterSampleQueued = YES;
-	sp->telemetry[HSP_TELEMETRY_COUNTER_SAMPLES]++;
-      }
+      sfl_poller_writeCountersSample(vm->poller, &cs);
+      sp->counterSampleQueued = YES;
+      sp->telemetry[HSP_TELEMETRY_COUNTER_SAMPLES]++;
     }
   }
 
   static void agentCB_getCounters_CONTAINERD_request(void *magic, SFLPoller *poller, SFL_COUNTERS_SAMPLE_TYPE *cs)
   {
-    //EVMod *mod = (EVMod *)magic;
-    //HSP_mod_CONTAINERD *mdata = (HSP_mod_CONTAINERD *)mod->data;
-    //HSPVMState_CONTAINERD *container = (HSPVMState_CONTAINERD *)poller->userData;
-    //UTHashAdd(mdata->pollActions, container);
+    // This is now a no-op.  The Go program determines the counter-reporting schedule.
   }
 
   /*_________________---------------------------__________________
@@ -545,6 +550,7 @@ extern "C" {
 	HSPVNIC *vnic = UTHashDelKey(mdata->vnicByIP, &search);
 	if(vnic) {
 	  my_free(vnic->c_name);
+	  my_free(vnic->c_hostname);
 	  my_free(vnic);
 	}
       }
@@ -553,29 +559,24 @@ extern "C" {
 
   static void removeAndFreeVM_CONTAINERD(EVMod *mod, HSPVMState_CONTAINERD *container) {
     HSP_mod_CONTAINERD *mdata = (HSP_mod_CONTAINERD *)mod->data;
-    if(getDebug()) {
-      myLog(LOG_INFO, "removeAndFreeVM: removing container with dsIndex=%u", container->vm.dsIndex);
-    }
 
-    
+    EVDebug(mod, 1, "removeAndFreeVM: removing container with dsIndex=%u", container->vm.dsIndex);
+
     // remove any VNIC lookups by IP
     // (the interfaces will be removed completely in removeAndFreeVM() below)
     if(mdata->vnicByIP)
       removeContainerVNICLookup(mod, container);
 
-    // remove from pollActions if present (necessary if this happens in tick() and before tock()
-    UTHashDel(mdata->pollActions, container);
-
     // remove from hash tables
     if(UTHashDel(mdata->vmsByID, container) == NULL) {
       myLog(LOG_ERR, "UTHashDel (vmsByID) failed: container %s=%s", container->name, container->id);
-      if(debug(1))
+      if(EVDebug(mod, 1, NULL))
 	containerHTPrint(mdata->vmsByID, "vmsByID");
     }
 
     if(UTHashDel(mdata->vmsByUUID, container) == NULL) {
       myLog(LOG_ERR, "UTHashDel (vmsByUUID) failed: container %s=%s", container->name, container->id);
-      if(debug(1))
+      if(EVDebug(mod, 1, NULL))
 	containerHTPrint(mdata->vmsByUUID, "vmsByUUID");
     }
 
@@ -637,15 +638,14 @@ extern "C" {
   */
 
   static void updateContainerAdaptors(EVMod *mod, HSPVMState_CONTAINERD *container) {
-    HSP *sp = (HSP *)EVROOTDATA(mod);
     HSPVMState *vm = &container->vm;
     if(vm) {
       // reset the information that we are about to refresh
-      adaptorListMarkAll(vm->interfaces);
+      markAdaptors_adaptorList(mod, vm->interfaces);
       // then refresh it
       readContainerInterfaces(mod, container);
       // and clean up
-      deleteMarkedAdaptors_adaptorList(sp, vm->interfaces);
+      deleteMarkedAdaptors_adaptorList(mod, vm->interfaces);
       adaptorListFreeMarked(vm->interfaces);
     }
   }
@@ -677,7 +677,7 @@ extern "C" {
 		  if(container->cgroup_devices)
 		    my_free(container->cgroup_devices);
 		  container->cgroup_devices = my_strdup(path);
-		  myDebug(1, "containerd: container(%s)->cgroup_devices=%s", container->name, container->cgroup_devices);
+		  EVDebug(mod, 1, "containerd: container(%s)->cgroup_devices=%s", container->name, container->cgroup_devices);
 		}
 	      }
 	    }
@@ -747,7 +747,7 @@ extern "C" {
 	//decNameCount(mdata->hostnameCount, container->hostname);
 	my_free(container->hostname);
       }
-      myDebug(1, "setContainerHostname assigning hostname=%s", hostname);
+      EVDebug(mod, 1, "setContainerHostname assigning hostname=%s", hostname);
       container->hostname = my_strdup(hostname);
       //if(incNameCount(mdata->hostnameCount, hostname) > 1) {
       //	duplicateHostname(mod, container);
@@ -782,25 +782,25 @@ extern "C" {
 	if(vvstr
 	   && my_strnequal(vvstr, HSP_NVIDIA_VIS_DEV_ENV, vlen)
 	   && vvstr[vlen] == '=') {
-	  myDebug(2, "parsing GPU env: %s", vvstr);
+	  EVDebug(mod, 2, "parsing GPU env: %s", vvstr);
 	  char *gpu_uuids = vvstr + vlen + 1;
 	  clearContainerGPUs(mod, container);
 	  // (re)populate
 	  char *str;
 	  char buf[128];
 	  while((str = parseNextTok(&gpu_uuids, ",", NO, 0, YES, buf, 128)) != NULL) {
-	    myDebug(2, "parsing GPU uuidstr: %s", str);
+	    EVDebug(mod, 2, "parsing GPU uuidstr: %s", str);
 	    // expect GPU-<uuid>
 	    if(my_strnequal(str, "GPU-", 4)) {
 	      HSPGpuID *gpu = my_calloc(sizeof(HSPGpuID));
 	      if(parseUUID(str + 4, gpu->uuid)) {
 		gpu->has_uuid = YES;
-		myDebug(2, "adding GPU uuid to container: %s", container->name);
+		EVDebug(mod, 2, "adding GPU uuid to container: %s", container->name);
 		UTArrayAdd(arr, gpu);
 		container->gpu_env = YES;
 	      }
 	      else {
-		myDebug(2, "GPU uuid parse failed");
+		EVDebug(mod, 2, "GPU uuid parse failed");
 		my_free(gpu);
 	      }
 	    }
@@ -851,7 +851,7 @@ extern "C" {
 	      HSPGpuID *gpu = my_calloc(sizeof(HSPGpuID));
 	      gpu->minor = minor;
 	      gpu->has_minor = YES;
-	      myDebug(2, "adding GPU dev to container: %s", container->name);
+	      EVDebug(mod, 2, "adding GPU dev to container: %s", container->name);
 	      UTArrayAdd(arr, gpu);
 	    }
 	  }
@@ -866,15 +866,13 @@ extern "C" {
     -----------------___________________________------------------
   */
 
-  static void logField(int debugLevel, char *msg, cJSON *obj, char *field)
+  static void logField(char *msg, cJSON *obj, char *field)
   {
-    if(debug(debugLevel)) {
-      cJSON *fieldObj = cJSON_GetObjectItem(obj, field);
-      char *str = fieldObj ? cJSON_Print(fieldObj) : NULL;
-      myLog(LOG_INFO, "%s %s=%s", msg, field, str ?: "<not found>");
-      if(str)
-	my_free(str);
-    }
+    cJSON *fieldObj = cJSON_GetObjectItem(obj, field);
+    char *str = fieldObj ? cJSON_Print(fieldObj) : NULL;
+    myLog(LOG_INFO, "%s %s=%s", msg, field, str ?: "<not found>");
+    if(str)
+      my_free(str);
   }
 
   /*_________________---------------------------__________________
@@ -904,20 +902,23 @@ extern "C" {
     cJSON *jmetrics = cJSON_GetObjectItem(top, "Metrics");
     if(!jmetrics)
       return;
-    
+
+    bool isSandbox = NO;
     cJSON *jnames = cJSON_GetObjectItem(jmetrics, "Names");
     if(jnames) {
       cJSON *jcgpth = cJSON_GetObjectItem(jnames, "CgroupsPath");
       if(jcgpth) {
-	myDebug(1, "cgroupspath=%s\n", jcgpth->valuestring);
+	EVDebug(mod, 1, "cgroupspath=%s\n", jcgpth->valuestring);
       }
-      logField(1, " ", jnames, "Image");
-      logField(1, " ", jnames, "Hostname");
-      logField(1, " ", jnames, "ContainerName");
-      logField(1, " ", jnames, "ContainerType");
-      logField(1, " ", jnames, "SandboxName");
-      logField(1, " ", jnames, "SandboxNamespace");
-      logField(1, " ", jnames, "ImageName");
+      if(EVDebug(mod, 1, NULL)) {
+	logField(" ", jnames, "Image");
+	logField(" ", jnames, "Hostname");
+	logField(" ", jnames, "ContainerName");
+	logField(" ", jnames, "ContainerType");
+	logField(" ", jnames, "SandboxName");
+	logField(" ", jnames, "SandboxNamespace");
+	logField(" ", jnames, "ImageName");
+      }
     }
     
     // TODO: skip "k8s_POD_*" containers
@@ -928,6 +929,7 @@ extern "C" {
     setContainerName(mod, container, jid->valuestring);
     
     cJSON *jn = cJSON_GetObjectItem(jnames, "ContainerName");
+    cJSON *jt = cJSON_GetObjectItem(jnames, "ContainerType");
     cJSON *jhn = cJSON_GetObjectItem(jnames, "Hostname");
     cJSON *jsn = cJSON_GetObjectItem(jnames, "SandboxName");
     cJSON *jsns = cJSON_GetObjectItem(jnames, "SandboxNamespace");
@@ -942,6 +944,7 @@ extern "C" {
       // the form k8s_<containername>_<sandboxname>_<sandboxnamespace>_<sandboxuser>_<c.attempt>
       // pull out name, hostname, sandboxname and sandboxnamespace
       char *jn_s = (jn && strlen(jn->valuestring)) ? jn->valuestring : NULL;
+      char *jt_s = (jt && strlen(jt->valuestring)) ? jt->valuestring : NULL;
       char *jhn_s = (jhn && strlen(jhn->valuestring)) ? jhn->valuestring : NULL;
       char *jsn_s = (jsn && strlen(jsn->valuestring)) ? jsn->valuestring : NULL;
       char *jsns_s = (jsns && strlen(jsns->valuestring)) ? jsns->valuestring : NULL;
@@ -962,6 +965,9 @@ extern "C" {
 	       jsns_s ?: "");
       // and assign to hostname
       setContainerHostname(mod, container, compoundName);
+      // remember if containerType is sandbox
+      if(my_strequal(jt_s, "sandbox"))
+	isSandbox = YES;
     }
     
     cJSON *jcpu = cJSON_GetObjectItem(jmetrics, "Cpu");
@@ -971,8 +977,7 @@ extern "C" {
       
       cJSON *jcputime = cJSON_GetObjectItem(jcpu, "CpuTime");
       if(jcputime) {
-	myDebug(1, "cputime=%.0f\n", jcputime->valuedouble);
-	container->cpu_total = jcputime->valuedouble; // TODO: is this an integer?
+	container->cpu_total = jcputime->valuedouble;
       }
       cJSON *jcpucount = cJSON_GetObjectItem(jcpu, "CpuCount");
       if(jcpucount)
@@ -1014,20 +1019,28 @@ extern "C" {
     if(container->last_vnic == 0
        || (now_mono - container->last_vnic) > HSP_VNIC_REFRESH_TIMEOUT) {
       container->last_vnic = now_mono;
-      // skip kubnetes "POD" containers to prevent IP clash
-      if(!my_strnequal(container->name, "k8s_POD_", 8))
+      // Each pod appears to have one container with type "sandbox" and
+      // one or more with type "container".  Although it is the containers
+      // that send/receive traffic it is potentially expensive to resolve
+      // which of them it was on a sample-by-sample basis.  That's because
+      // they share the same network namespace so the (inner) IP address
+      // is not enough and we would have to look up the container by following
+      // the TCP/UDP socket inode to PID (see mod_systemd). If that socket
+      // lookup can be done efficiently (e.g. by using a network namespace
+      // parameter in the netlink DIAG call) then we can try it,  but for
+      // now we will associate traffic with the sandbox container, effectively
+      // appointing it as the representative for the pod.
+      if(isSandbox)
 	updateContainerAdaptors(mod, container);
     }
 
     if(container->last_cgroup == 0
        || (now_mono - container->last_cgroup) > HSP_CGROUP_REFRESH_TIMEOUT) {
       container->last_cgroup = now_mono;
-      // TODO: skip kubnetes "POD" containers, but we might want to reverse this
-      if(!my_strnequal(container->name, "k8s_POD_", 8))
-	updateContainerCgroupPaths(mod, container);
+      updateContainerCgroupPaths(mod, container);
     }
 
-    cJSON *jenv = cJSON_GetObjectItem(jmetrics, "Env");
+    cJSON *jenv = cJSON_GetObjectItem(top, "Env");
     if(jenv
        && container->gpu_dev == NO)
       readContainerGPUsFromEnv(mod, container, jenv);
@@ -1059,18 +1072,18 @@ extern "C" {
       break;
     case EVSOCKETREAD_STR:
       // UTStrBuf_chomp(sock->ioline);
-      myDebug(1, "readContainerCB: %s", UTSTRBUF_STR(sock->ioline));
+      EVDebug(mod, 1, "readContainerCB: %s", UTSTRBUF_STR(sock->ioline));
       readContainerData(mod, UTSTRBUF_STR(sock->ioline), magic);
       UTStrBuf_reset(sock->ioline);
       break;
     case EVSOCKETREAD_EOF:
-      myDebug(1, "readContainerCB EOF");
+      EVDebug(mod, 1, "readContainerCB EOF");
       break;
     case EVSOCKETREAD_BADF:
-      myDebug(1, "readContainerCB BADF");
+      EVDebug(mod, 1, "readContainerCB BADF");
       break;
     case EVSOCKETREAD_ERR:
-      myDebug(1, "readContainerCB ERR");
+      EVDebug(mod, 1, "readContainerCB ERR");
       break;
     }
   }
@@ -1081,68 +1094,94 @@ extern "C" {
     Packet Bus
   */
 
-  static void evt_flow_sample(EVMod *mod, EVEvent *evt, void *data, size_t dataLen) {
-    HSP_mod_CONTAINERD *mdata = (HSP_mod_CONTAINERD *)mod->data;
-    HSPPendingSample *ps = (HSPPendingSample *)data;
-    int ip_ver = decodePendingSample(ps);
-    int ip_offset = 0;
-    switch(mdata->vnicLayer) {
-    case HSP_VNIC_LAYER_IP:
-      if(ip_ver == 4
-	 && ps->l3_offset)
-	ip_offset = ps->l3_offset;
-      break;
-    case HSP_VNIC_LAYER_IPIP:
-      if(ip_ver == 4
-	 && ps->ipproto == 4 // IP-over-IP
-	 && ps->l4_offset)
-	ip_offset = ps->l4_offset;
-      break;
-    default:
-      break;
+  static uint32_t containerDSByMAC(EVMod *mod, SFLMacAddress *mac) {
+    HSP *sp = (HSP *)EVROOTDATA(mod);
+    SFLAdaptor *adaptor = adaptorByMac(sp, mac);
+    if(adaptor) {
+      uint32_t c_dsi = ADAPTOR_NIO(adaptor)->container_dsIndex;
+      EVDebug(mod, 2, "containerDSByMAC matched %s ds=%u\n", adaptor->deviceName, c_dsi);
+      // make sure it wasn't marked as "non-unique"
+      if(c_dsi != 0xFFFFFFFF)
+	return c_dsi;
     }
-    if(ip_offset) {
-      uint32_t src_dsIndex=0, dst_dsIndex=0;
-      HSPVNIC search = { };
-      HSPVNIC *vnic;
-      search.ipAddr.type = SFLADDRESSTYPE_IP_V4;
-      memcpy(&search.ipAddr.address.ip_v4.addr, ps->hdr + ip_offset + 12, 4);
-      if(getDebug() > 2) {
-	char ipStr[64];
-	SFLAddress_print(&search.ipAddr, ipStr, 64);
-	myDebug(1, "VNIC: test src IP %s\n", ipStr);
+    return 0;
+  }
+
+  static uint32_t containerDSByIP(EVMod *mod, SFLAddress *ipAddr) {
+    HSP_mod_CONTAINERD *mdata = (HSP_mod_CONTAINERD *)mod->data;
+    HSPVNIC search = { };
+    search.ipAddr = *ipAddr;
+    HSPVNIC *vnic = UTHashGet(mdata->vnicByIP, &search);
+    if(vnic) {
+      EVDebug(mod, 2, "VNIC: got src %s (unique=%s, ds=%u)\n",
+	      vnic->c_hostname,
+	      vnic->unique ? "YES" : "NO",
+	      vnic->dsIndex);
+      if(vnic->unique)
+	return vnic->dsIndex;
+    }
+    return 0;
+  }
+  
+  static bool lookupContainerDS(EVMod *mod, HSPPendingSample *ps, uint32_t *p_src_dsIndex, uint32_t *p_dst_dsIndex) {
+    // start with the one most likely to match
+    // e.g. in Kubernetes with Calico IPIP or VXLAN this will be the innerIP:
+    if(ps->gotInnerIP) {
+      char sbuf[51],dbuf[51];
+      *p_src_dsIndex = containerDSByIP(mod, &ps->src_1);
+      *p_dst_dsIndex = containerDSByIP(mod, &ps->dst_1);
+      
+      EVDebug(mod, 3, "lookupContainerDS: search by inner IP: src=%s dst=%s srcDS=%u dstDS=%u",
+	      SFLAddress_print(&ps->src_1, sbuf, 50),
+	      SFLAddress_print(&ps->dst_1, dbuf, 50),
+	      *p_src_dsIndex,
+	      *p_dst_dsIndex);
+      
+      if(*p_src_dsIndex || *p_dst_dsIndex)
+	return YES;
+    }
+    if(ps->gotInnerMAC) {
+      *p_src_dsIndex = containerDSByMAC(mod, &ps->macsrc_1);
+      *p_dst_dsIndex = containerDSByMAC(mod, &ps->macdst_1);
+      if(*p_src_dsIndex || *p_dst_dsIndex)
+	return YES;
+    }
+    if(ps->l3_offset) {
+      // outer IP
+      *p_src_dsIndex = containerDSByIP(mod, &ps->src);
+      *p_dst_dsIndex = containerDSByIP(mod, &ps->dst);
+      if(*p_src_dsIndex || *p_dst_dsIndex)
+	return YES;
+    }
+    if(ps->hdr_protocol == SFLHEADER_ETHERNET_ISO8023) {
+      // outer MAC
+      *p_src_dsIndex = containerDSByMAC(mod, &ps->macsrc);
+      *p_dst_dsIndex = containerDSByMAC(mod, &ps->macdst);
+      if(*p_src_dsIndex || *p_dst_dsIndex)
+	return YES;
+    }
+    return NO;
+  }
+  
+  static void evt_flow_sample(EVMod *mod, EVEvent *evt, void *data, size_t dataLen) {
+    // HSP_mod_CONTAINERD *mdata = (HSP_mod_CONTAINERD *)mod->data;
+    HSPPendingSample *ps = (HSPPendingSample *)data;
+    decodePendingSample(ps);
+    uint32_t src_dsIndex=0, dst_dsIndex=0;
+    if(lookupContainerDS(mod, ps, &src_dsIndex, &dst_dsIndex)) {
+      SFLFlow_sample_element *entElem = pendingSample_calloc(ps, sizeof(SFLFlow_sample_element));
+      entElem->tag = SFLFLOW_EX_ENTITIES;
+      if(src_dsIndex
+	 && src_dsIndex != 0xFFFFFFFF) {
+	entElem->flowType.entities.src_dsClass = SFL_DSCLASS_LOGICAL_ENTITY;
+	entElem->flowType.entities.src_dsIndex = src_dsIndex;
       }
-      vnic = UTHashGet(mdata->vnicByIP, &search);
-      if(vnic
-	 && vnic->unique) {
-	src_dsIndex = vnic->dsIndex;
-	myDebug(1, "VNIC: got %s (ds=%u)\n", vnic->c_name, vnic->dsIndex);
+      if(dst_dsIndex
+	 && dst_dsIndex != 0xFFFFFFFF) {
+	entElem->flowType.entities.dst_dsClass = SFL_DSCLASS_LOGICAL_ENTITY;
+	entElem->flowType.entities.dst_dsIndex = dst_dsIndex;
       }
-      memcpy(&search.ipAddr.address.ip_v4.addr, ps->hdr + ip_offset + 16, 4);
-      if(getDebug() > 2) {
-	char ipStr[64];
-	SFLAddress_print(&search.ipAddr, ipStr, 64);
-	myDebug(1, "VNIC: test dst IP %s\n", ipStr);
-      }
-      vnic = UTHashGet(mdata->vnicByIP, &search);
-      if(vnic
-	 && vnic->unique) {
-	dst_dsIndex = vnic->dsIndex;
-	myDebug(1, "VNIC: got %s (ds=%u)\n", vnic->c_name, vnic->dsIndex);
-      }
-      if(src_dsIndex || dst_dsIndex) {
-	SFLFlow_sample_element *entElem = pendingSample_calloc(ps, sizeof(SFLFlow_sample_element));
-	entElem->tag = SFLFLOW_EX_ENTITIES;
-	if(src_dsIndex) {
-	  entElem->flowType.entities.src_dsClass = SFL_DSCLASS_LOGICAL_ENTITY;
-	  entElem->flowType.entities.src_dsIndex = src_dsIndex;
-	}
-	if(dst_dsIndex) {
-	  entElem->flowType.entities.dst_dsClass = SFL_DSCLASS_LOGICAL_ENTITY;
-	  entElem->flowType.entities.dst_dsIndex = dst_dsIndex;
-	}
-	SFLADD_ELEMENT(ps->fs, entElem);
-      }
+      SFLADD_ELEMENT(ps->fs, entElem);
     }
   }
 
@@ -1152,7 +1191,7 @@ extern "C" {
   */
 
   static void readCB(EVMod *mod, EVSocket *sock, void *magic) {
-    EVSocketReadLines(mod, sock, readContainerCB, YES, magic);
+    EVSocketReadLines(mod, sock, readContainerCB, NO, magic);
   }
 
   static void evt_cfg_done(EVMod *mod, EVEvent *evt, void *data, size_t dataLen) {
@@ -1197,7 +1236,7 @@ extern "C" {
     struct stat statBuf;
     if(sp->docker.docker == YES
        && stat("/var/run/docker.sock", &statBuf) == 0) {
-      myDebug(1, "not enabling mod_containerd because mod_docker is running and docker.sock is present");
+      EVDebug(mod, 1, "not enabling mod_containerd because mod_docker is running and docker.sock is present");
       return;
     }
 
@@ -1212,7 +1251,6 @@ extern "C" {
     mdata->vmsByID = UTHASH_NEW(HSPVMState_CONTAINERD, id, UTHASH_SKEY);
     mdata->nameCount = UTHASH_NEW(HSPContainerNameCount, name, UTHASH_SKEY);
     mdata->hostnameCount = UTHASH_NEW(HSPContainerNameCount, name, UTHASH_SKEY);
-    mdata->pollActions = UTHASH_NEW(HSPVMState_CONTAINERD, id, UTHASH_IDTY);
     mdata->cgroupPathIdx = -1;
     
     // register call-backs
@@ -1226,11 +1264,10 @@ extern "C" {
       EVBus *packetBus = EVGetBus(mod, HSPBUS_PACKET, YES);
       EVEventRx(mod, EVGetEvent(packetBus, HSPEVENT_FLOW_SAMPLE), evt_flow_sample);
       mdata->vnicByIP = UTHASH_NEW(HSPVNIC, ipAddr, UTHASH_SYNC); // need sync (poll + packet thread)
-      mdata->vnicLayer = HSP_VNIC_LAYER_IPIP; // TODO: make config parameter
 
       // learn my own namespace inode from /proc/self/ns/net
       if(stat("/proc/self/ns/net", &mdata->myNS) == 0)
-	myDebug(1, "my namespace dev.inode == %u.%u",
+	EVDebug(mod, 1, "my namespace dev.inode == %u.%u",
 		mdata->myNS.st_dev,
 		mdata->myNS.st_ino);
     }

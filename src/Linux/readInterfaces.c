@@ -33,6 +33,7 @@ extern "C" {
 
   void readVLANs(HSP *sp)
   {
+    EVMod *mod = sp->rootModule;
     // mark interfaces that are specific to a VLAN
     FILE *procFile = fopen(PROCFS_STR "/net/vlan/config", "r");
     if(procFile) {
@@ -53,7 +54,7 @@ extern "C" {
 	    if(adaptor &&
 	       vlan >= 0 && vlan < 4096) {
 	      ADAPTOR_NIO(adaptor)->vlan = vlan;
-	      myDebug(1, "adaptor %s has 802.1Q vlan %d", devName, vlan);
+	      EVDebug(mod, 1, "adaptor %s has 802.1Q vlan %d", devName, vlan);
 	    }
 	  }
 	}
@@ -67,15 +68,24 @@ extern "C" {
     ----------------___________________________------------------
   */
 
-  static bool addLocalIP(UTHash *ht, SFLAddress *addr, char *dev) {
+  static bool addLocalIP(HSP *sp, UTHash *ht, SFLAddress *addr, char *dev) {
     HSPLocalIP searchIP = { .ipAddr = *addr };
-    if(UTHashGet(ht, &searchIP) == NULL) {
-      HSPLocalIP *lip = localIPNew(addr, dev);
+    HSPLocalIP *lip = UTHashGet(ht, &searchIP);
+    bool added = NO;
+    if(lip == NULL) {
+      lip = localIPNew(addr, dev);
       UTHashAdd(ht, lip);
       lip->discoveryIndex = UTHashN(ht);
-      return YES;
+      added = YES;
     }
-    return NO;
+    else {
+      // keep the set of all devs this address was seen on
+      // in case one of them is the preferred one for agent
+      // address selection.
+      if(!strArrayContains(lip->devs, dev))
+	strArrayAdd(lip->devs, dev);
+    }
+    return added;
   }
 
   static void freeLocalIPs(UTHash *ht) {
@@ -86,33 +96,6 @@ extern "C" {
   }
 
 
-/*________________---------------------------__________________
-  ________________  setAddressPriorities     __________________
-  ----------------___________________________------------------
-  Ideally we would do this as we go along,  but since the vlan
-  info is spliced in separately we have to wait for that and
-  then set the priorities for the whole list.
-*/
-  static void setAddressPriorities(HSP *sp, UTHash *addrHT)
-  {
-    myDebug(1, "setAddressPriorities");
-    if(addrHT) {
-      HSPLocalIP *lip;
-      UTHASH_WALK(addrHT, lip) {
-	SFLAdaptor *adaptor = adaptorByName(sp, lip->dev);
-	if(adaptor) {
-	  HSPAdaptorNIO *adaptorNIO = ADAPTOR_NIO(adaptor);
-	  if(adaptorNIO) {
-	    lip->ipPriority = agentAddressPriority(sp,
-						   &lip->ipAddr,
-						   adaptorNIO->vlan,
-						   adaptorNIO->loopback);
-	  }
-	}
-      }
-    }
-  }
-
   /*________________---------------------------__________________
     ________________     readL3Addresses       __________________
     ----------------___________________________------------------
@@ -121,6 +104,7 @@ extern "C" {
     
   static int readL3Addresses(HSP *sp, UTHash *localIP, UTHash *localIP6)
   {
+    EVMod *mod = sp->rootModule;
     int addresses_added = 0;
     // getifaddrs(3) first appeared in glibc 2.3
     // and first included v6 addresses in 2.3.3
@@ -129,7 +113,7 @@ extern "C" {
 
     
     if(getifaddrs(&ifap) != 0) {
-      myDebug(1, "readL3Addresses: getifaddrs() failed : %s", strerror(errno));
+      EVDebug(mod, 1, "readL3Addresses: getifaddrs() failed : %s", strerror(errno));
       return 0;
     }
     for(struct ifaddrs *ifa = ifap; ifa; ifa = ifa->ifa_next) {
@@ -139,7 +123,7 @@ extern "C" {
       bool bond_master = (ifa->ifa_flags & IFF_MASTER) ? YES : NO;
       bool bond_slave = (ifa->ifa_flags & IFF_SLAVE) ? YES : NO;
 
-      myDebug(1, "readL3Addresses: ifa_name=%s up=%d loopback=%d promisc=%d bond(master=%u,slave=%u)",
+      EVDebug(mod, 1, "readL3Addresses: ifa_name=%s up=%d loopback=%d promisc=%d bond(master=%u,slave=%u)",
 	      ifa->ifa_name,
 	      up,
 	      loopback,
@@ -154,7 +138,7 @@ extern "C" {
 
       SFLAdaptor *adaptor = adaptorByName(sp, ifa->ifa_name);
       if(adaptor == NULL) {
-	myDebug(1, "readL3Addreses: ignoring IP address for unknown device: %s", ifa->ifa_name);
+	EVDebug(mod, 1, "readL3Addreses: ignoring IP address for unknown device: %s", ifa->ifa_name);
 	continue;
       }
       
@@ -182,14 +166,14 @@ extern "C" {
 	// better to read them from /proc, ethtool or Netlink.
 	break;
       default:
-	myDebug(1, "readL3Addresses: unexpected family = %u", ifa->ifa_addr->sa_family);
+	EVDebug(mod, 1, "readL3Addresses: unexpected family = %u", ifa->ifa_addr->sa_family);
 	break;
       }
       
       if(addrHT) {
 	char ipbuf[51];
-	myDebug(1, "readL3Addresses: found=%s\n", SFLAddress_print(&addr, ipbuf, 50));
-	if(addLocalIP(addrHT, &addr, ifa->ifa_name))
+	EVDebug(mod, 1, "readL3Addresses: found=%s\n", SFLAddress_print(&addr, ipbuf, 50));
+	if(addLocalIP(sp, addrHT, &addr, ifa->ifa_name))
 	  addresses_added++;
       }
     }
@@ -197,7 +181,7 @@ extern "C" {
     // clean up
     freeifaddrs(ifap);
 
-    myDebug(1, "readL3Addresses: found %u extra L3 addresses", addresses_added);
+    EVDebug(mod, 1, "readL3Addresses: found %u extra L3 addresses", addresses_added);
 
 #endif
     return addresses_added;
@@ -210,6 +194,7 @@ extern "C" {
 
   static int readIPv6Addresses(HSP *sp, UTHash *addrHT)
   {
+    EVMod *mod = sp->rootModule;
     int addresses_added = 0;
     FILE *procFile = fopen(PROCFS_STR "/net/if_inet6", "r");
     if(procFile) {
@@ -218,7 +203,6 @@ extern "C" {
       int truncated;
       while(my_readline(procFile, line, MAX_PROC_LINE_CHARS, &truncated) != EOF) {
 	// expect lines of the form "<address> <netlink_no> <prefix_len(HEX)> <scope(HEX)> <flags(HEX)> <deviceName>
-	// (with a header line on the first row)
 	char devName[MAX_PROC_LINE_CHARS];
 	u_char addr[MAX_PROC_LINE_CHARS];
 	u_int devNo, maskBits, scope, flags;
@@ -231,7 +215,7 @@ extern "C" {
 		  &flags,
 		  devName) == 6) {
 
-	  myDebug(1, "adaptor %s has v6 address %s with scope 0x%x",
+	  EVDebug(mod, 1, "adaptor %s has v6 address %s with scope 0x%x",
 		devName,
 		addr,
 		scope);
@@ -244,7 +228,7 @@ extern "C" {
 	      SFLAddress v6addr;
 	      v6addr.type = SFLADDRESSTYPE_IP_V6;
 	      if(hexToBinary(addr, v6addr.address.ip_v6.addr, 16) == 16) {
-		if(addLocalIP(addrHT, &v6addr, adaptor->deviceName))
+		if(addLocalIP(sp, addrHT, &v6addr, adaptor->deviceName))
 		  addresses_added++;
 	      }
 	    }
@@ -448,7 +432,8 @@ extern "C" {
   ________________  ethtool_get_GMODULEINFO  __________________
   ----------------___________________________------------------
 */
-  static bool ethtool_get_GMODULEINFO(struct ifreq *ifr, int fd, SFLAdaptor *adaptor) {
+  static bool ethtool_get_GMODULEINFO(HSP *sp, struct ifreq *ifr, int fd, SFLAdaptor *adaptor) {
+    EVMod *mod = sp->rootModule;
     /* avoid re-testing this every time in case it is slow */
     HSPAdaptorNIO *adaptorNIO = ADAPTOR_NIO(adaptor);
     // optical data
@@ -463,7 +448,7 @@ extern "C" {
       modinfo.cmd = ETHTOOL_GMODULEINFO;
       ifr->ifr_data = (char *)&modinfo;
       if(ioctl(fd, SIOCETHTOOL, ifr) >= 0) {
-	myLog(LOG_INFO, "ETHTOOL_GMODULEINFO %s succeeded eeprom_len = %u eeprom_type=%u",
+	EVDebug(mod, 1, "ETHTOOL_GMODULEINFO %s succeeded eeprom_len = %u eeprom_type=%u",
 	      adaptor->deviceName,
 	      modinfo.eeprom_len,
 	      modinfo.type);
@@ -472,7 +457,7 @@ extern "C" {
 	return YES;
       }
       else {
-	myDebug(1, "ETHTOOL_GMODULEINF0 %s failed : %s",
+	EVDebug(mod, 1, "ETHTOOL_GMODULEINF0 %s failed : %s",
 		adaptor->deviceName,
 		strerror(errno));
       }
@@ -505,7 +490,7 @@ extern "C" {
   ----------------___________________________------------------
 */
 
-  static bool ethtool_get_GDRVINFO(struct ifreq *ifr, int fd, SFLAdaptor *adaptor)
+  static bool ethtool_get_GDRVINFO(HSP *sp, struct ifreq *ifr, int fd, SFLAdaptor *adaptor)
   {
     // set device type from ethtool driver info - could also have gone
     // to /sys/class/net/<device>/.
@@ -543,6 +528,7 @@ extern "C" {
 
   static void ethtool_get_GSTATS(HSP *sp, struct ifreq *ifr, int fd, SFLAdaptor *adaptor)
   {
+    EVMod *mod = sp->rootModule;
     // see if the ethtool stats block can give us multicast/broadcast counters too
     HSPAdaptorNIO *adaptorNIO = ADAPTOR_NIO(adaptor);
     adaptorNIO->et_nctrs = ethtool_num_counters(ifr, fd);
@@ -561,7 +547,7 @@ extern "C" {
 	adaptorNIO->et_found = 0;
 	for(int ii=0; ii < adaptorNIO->et_nctrs; ii++) {
 	  memcpy(cname, &ctrNames->data[ii * ETH_GSTRING_LEN], ETH_GSTRING_LEN);
-	  myDebug(3, "ethtool counter %s is at index %d", cname, ii);
+	  EVDebug(mod, 3, "ethtool counter %s is at index %d", cname, ii);
 	  // then see if this is one of the ones we want,
 	  // and record the index if it is.
 	  if(staticStringsIndexOf(HSP_ethtool_mcasts_in_names, cname) != -1) {
@@ -597,7 +583,7 @@ extern "C" {
 	      if(ioctl(fd, SIOCETHTOOL, ifr) >= 0) {
 		adaptor->peer_ifIndex = et_stats->data[ii];
 		adaptorAddOrReplace(sp->adaptorsByPeerIndex, adaptor, "byPeerIndex");
-		myDebug(1, "Interface %s (ifIndex=%u) has peer_ifindex=%u",
+		EVDebug(mod, 1, "Interface %s (ifIndex=%u) has peer_ifindex=%u",
 			adaptor->deviceName,
 			adaptor->ifIndex,
 			adaptor->peer_ifIndex);
@@ -621,12 +607,12 @@ extern "C" {
     HSPAdaptorNIO *nio = ADAPTOR_NIO(adaptor);
 
     if(nio->ethtool_GDRVINFO) {
-      changed |= ethtool_get_GDRVINFO(ifr, fd, adaptor);
+      changed |= ethtool_get_GDRVINFO(sp, ifr, fd, adaptor);
     }
 
 #if ( HSP_OPTICAL_STATS && ETHTOOL_GMODULEINFO )
     if(nio->ethtool_GMODULEINFO) {
-      changed |= ethtool_get_GMODULEINFO(ifr, fd, adaptor);
+      changed |= ethtool_get_GMODULEINFO(sp, ifr, fd, adaptor);
     }
 #endif
 
@@ -667,6 +653,7 @@ extern "C" {
 
   bool detectInterfaceChange(HSP *sp)
   {
+    EVMod *mod = sp->rootModule;
     int fd = socket (PF_INET, SOCK_DGRAM, 0);
     if (fd < 0) {
       fprintf (stderr, "error opening socket: %d (%s)\n", errno, strerror(errno));
@@ -675,12 +662,12 @@ extern "C" {
     SFLAdaptor *changed = NULL;
     SFLAdaptor *ad;
     UTHASH_WALK(sp->adaptorsByName, ad) {
-      myDebug(3, "detectInterfaceChange: testing %s", ad->deviceName);
+      EVDebug(mod, 3, "detectInterfaceChange: testing %s", ad->deviceName);
       struct ifreq ifr;
       memset(&ifr, 0, sizeof(ifr));
       strncpy(ifr.ifr_name, ad->deviceName, IFNAMSIZ-1);
       if(ioctl(fd,SIOCGIFFLAGS, &ifr) < 0) {
-	myDebug(1, "device %s Get SIOCGIFFLAGS failed : %s",
+	EVDebug(mod, 1, "device %s Get SIOCGIFFLAGS failed : %s",
 		ad->deviceName,
 		strerror(errno));
 	changed = ad;
@@ -701,7 +688,7 @@ extern "C" {
     }
     close (fd);
     if(changed)
-      myDebug(1, "detectInterfaceChange: found change in %s", changed->deviceName);
+      EVDebug(mod, 1, "detectInterfaceChange: found change in %s", changed->deviceName);
     return (changed != NULL);
   }
 
@@ -712,14 +699,24 @@ extern "C" {
 
   int readInterfaces(HSP *sp, bool full_discovery,  uint32_t *p_added, uint32_t *p_removed, uint32_t *p_cameup, uint32_t *p_wentdown, uint32_t *p_changed)
   {
-  uint32_t ad_added=0, ad_removed=0, ad_cameup=0, ad_wentdown=0, ad_changed=0;
+    EVMod *mod = sp->rootModule;
+
+    if(full_discovery)
+      EVEventTxAll(mod, HSPEVENT_INTFS_START, NULL, 0);
+
+    uint32_t ad_added=0, ad_removed=0, ad_cameup=0, ad_wentdown=0, ad_changed=0;
 
   // keep v4 and v6 separate to simplify HT logic
   UTHash *newLocalIP = UTHASH_NEW(HSPLocalIP, ipAddr.address.ip_v4, UTHASH_DFLT);
   UTHash *newLocalIP6 = UTHASH_NEW(HSPLocalIP, ipAddr.address.ip_v6, UTHASH_DFLT);
 
-  // mark-and-sweep. Mark all existing adaptors
-  { SFLAdaptor *ad;  UTHASH_WALK(sp->adaptorsByName, ad) ad->marked = YES; }
+  // mark-and-sweep. Mark all existing adaptors (that are managed by this mod)
+  {
+    SFLAdaptor *ad;
+    UTHASH_WALK(sp->adaptorsByName, ad)
+      if(ad->marked == mod->id)
+	markAdaptor(ad);
+  }
 
   // Walk the interfaces and collect the non-loopback interfaces so that we
   // have a list of MAC addresses for each interface (usually only 1).
@@ -754,11 +751,12 @@ extern "C" {
       // we set the ifr_name field to make our queries
       strncpy(ifr.ifr_name, devName, IFNAMSIZ-1);
 
-      myDebug(3, "reading interface %s", devName);
+      EVDebug(mod, 3, "reading interface %s", devName);
 
       // Get the flags for this interface
       if(ioctl(fd,SIOCGIFFLAGS, &ifr) < 0) {
-	myLog(LOG_ERR, "device %s Get SIOCGIFFLAGS failed : %s",
+	// Can get here if the interface was just removed under our feet.
+	myLog(LOG_INFO, "device %s Get SIOCGIFFLAGS failed : %s",
 	      devName,
 	      strerror(errno));
 	continue;
@@ -781,7 +779,7 @@ extern "C" {
       u_char macBytes[6];
       int gotMac = NO;
       if(ioctl(fd,SIOCGIFHWADDR, &ifr) < 0) {
-	myLog(LOG_ERR, "device %s Get SIOCGIFHWADDR failed : %s",
+	myLog(LOG_INFO, "device %s Get SIOCGIFHWADDR failed : %s",
 	      devName,
 	      strerror(errno));
       }
@@ -794,7 +792,7 @@ extern "C" {
       uint32_t ifIndex = 0;
       if(ioctl(fd,SIOCGIFINDEX, &ifr) < 0) {
 	// only complain about this if we are debugging
-	myDebug(1, "device %s Get SIOCGIFINDEX failed : %s",
+	EVDebug(mod, 1, "device %s Get SIOCGIFINDEX failed : %s",
 		devName,
 		strerror(errno));
       }
@@ -812,7 +810,7 @@ extern "C" {
       // for now just assume that each interface has only one MAC.  It's not clear how we can
       // learn multiple MACs this way anyhow.  It seems like there is just one per ifr record.
       // find or create a new "adaptor" entry
-      SFLAdaptor *adaptor = nioAdaptorNew(devName, (gotMac ? macBytes : NULL), ifIndex);
+      SFLAdaptor *adaptor = nioAdaptorNew(mod, devName, (gotMac ? macBytes : NULL), ifIndex);
 
       bool addAdaptorToHT = YES;
 
@@ -825,8 +823,8 @@ extern "C" {
 	adaptorFree(adaptor);
 	// this adaptor is going to survive
 	adaptor = existing;
-	// clear the mark so we don't free it below
-	adaptor->marked = NO;
+	// reset the mark so we don't free it below
+	unmarkAdaptor(adaptor);
 	// indicate that it is already in the lookup tables
 	addAdaptorToHT = NO;
       }
@@ -843,7 +841,7 @@ extern "C" {
 	  adaptorNIO->ethtool_GMODULEINFO = YES;
 	}
 	else ad_wentdown++;
-	myDebug(1, "adaptor %s %s",
+	EVDebug(mod, 1, "adaptor %s %s",
 		adaptor->deviceName,
 		up ? "came up" : "went down");
       }
@@ -862,7 +860,7 @@ extern "C" {
       // Try to get the IP address for this interface
       if(ioctl(fd,SIOCGIFADDR, &ifr) < 0) {
 	// only complain about this if we are debugging
-	myDebug(1, "device %s Get SIOCGIFADDR failed : %s",
+	EVDebug(mod, 1, "device %s Get SIOCGIFADDR failed : %s",
 		devName,
 		strerror(errno));
       }
@@ -873,7 +871,7 @@ extern "C" {
 	  adaptorNIO->ipAddr.type = SFLADDRESSTYPE_IP_V4;
 	  adaptorNIO->ipAddr.address.ip_v4.addr = s->sin_addr.s_addr;
 	  // add to localIP hash too
-	  addLocalIP(newLocalIP, &adaptorNIO->ipAddr, adaptor->deviceName);
+	  addLocalIP(sp, newLocalIP, &adaptorNIO->ipAddr, adaptor->deviceName);
 	}
 	//else if (ifr.ifr_addr.sa_family == AF_INET6) {
 	// not sure this ever happens - on a linux system IPv6 addresses
@@ -888,6 +886,15 @@ extern "C" {
 	// (and influence ethtool data-gathering).  We broadcast this
 	// but it only really makes sense to receive it on the POLL_BUS
 	EVEventTxAll(sp->rootModule, HSPEVENT_INTF_READ, &adaptor, sizeof(adaptor));
+	if(adaptorNIO->changed_external) {
+	  // notice the change here, then reset it
+	  // for the next cycle.  So any external change
+	  // between now and then will be noticed.
+	  ad_changed++;
+	  adaptorNIO->changed_external = NO;
+	}
+	// TODO: need flag in adaptor to indicate that something changed - so we
+	// can increment ad_changed here.
 	// use ethtool to get info about direction/speed, peer_ifIndex and more
 	if(read_ethtool_info(sp, &ifr, fd, adaptor) == YES) {
 	  ad_changed++;
@@ -924,12 +931,6 @@ extern "C" {
   readL3Addresses(sp, newLocalIP, newLocalIP6);
   readIPv6Addresses(sp, newLocalIP6);
 
-  // now that we have the evidence gathered together, we can
-  // set the L3 address priorities (used for auto-selecting
-  // the sFlow-agent-address if requrired to by the config.
-  setAddressPriorities(sp, newLocalIP);
-  setAddressPriorities(sp, newLocalIP6);
-
   if(p_added) *p_added = ad_added;
   if(p_removed) *p_removed = ad_removed;
   if(p_cameup) *p_cameup = ad_cameup;
@@ -945,6 +946,9 @@ extern "C" {
     freeLocalIPs(oldLocalIP);
   if(oldLocalIP6)
     freeLocalIPs(oldLocalIP6);
+
+  if(full_discovery)
+      EVEventTxAll(mod, HSPEVENT_INTFS_END, NULL, 0);
 
   return sp->adaptorsByName->entries;
 }
