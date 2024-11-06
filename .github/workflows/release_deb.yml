@@ -1,4 +1,4 @@
-name: Build and release DEB
+name: Build and release DEB packages
 
 on:
   push:

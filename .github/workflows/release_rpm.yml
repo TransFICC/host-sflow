@@ -1,4 +1,4 @@
-name: Build and release RPM
+name: Build and release RPM packages
 
 on:
   push:
