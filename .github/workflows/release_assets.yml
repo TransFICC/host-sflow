@@ -61,8 +61,8 @@ jobs:
         # This pulls from the CREATE RELEASE step above, referencing it's ID to get its outputs object, which include a `upload_url`.
         # See this blog post for more info: https://jasonet.co/posts/new-features-of-github-actions/#passing-data-to-future-steps
         upload_url: ${{ steps.create_release.outputs.upload_url }}
-        asset_path: ./hsflowd-${{ env.MYVER }}-${{ env.MYREL }}.${{ env.MYARCH }}.deb
-        asset_name: hsflowd-${{ env.MYVER }}-${{ env.MYREL }}.${{ env.MYARCH }}.deb
+        asset_path: ./hsflowd_${{ env.MYVER }}-${{ env.MYREL }}_amd64.deb
+        asset_name: hsflowd_${{ env.MYVER }}-${{ env.MYREL }}_amd64.deb
         asset_content_type: application/octet-stream
         overwrite: true
     - name: Upload standard release asset
